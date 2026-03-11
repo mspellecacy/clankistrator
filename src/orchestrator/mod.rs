@@ -7,6 +7,7 @@ use rig::completion::Prompt;
 use rig::providers::openai;
 use std::env;
 use crate::orchestrator::prompts::ORCHESTRATOR_SYSTEM_PROMPT;
+use crate::tools::SpawnAgent;
 
 pub struct Orchestrator {
     pub model: String,
@@ -46,6 +47,7 @@ impl Orchestrator {
         let client = openai::Client::new(&openai_key);
         let agent = client.agent(&self.model)
             .preamble(ORCHESTRATOR_SYSTEM_PROMPT)
+            .tool(SpawnAgent)
             .build();
             
         let prompt = format!(
@@ -112,9 +114,67 @@ impl Orchestrator {
             
             // Update context with result
             if let Some(t) = context.get_task_mut(&task_id) {
-                t.status = TaskStatus::Completed {
+                t.status = TaskStatus::ReadyForReview {
                     output_summary: result.summary,
                 };
+            }
+        }
+
+        // 2. Review Phase
+        let review_task_ids: Vec<String> = context.get_tasks_for_review().iter().map(|t| t.id.clone()).collect();
+        for task_id in review_task_ids {
+            println!("Orchestrator: Dispatching task {} for review", task_id);
+
+            let (title, description, summary) = if let Some(t) = context.get_task_mut(&task_id) {
+                if let TaskStatus::ReadyForReview { output_summary } = &t.status {
+                    let summary = output_summary.clone();
+                    t.status = TaskStatus::Reviewing("GenericQA".to_string());
+                    (t.title.clone(), t.description.clone(), summary)
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
+
+            let qa_worker = GenericWorker::new(
+                AgentRole::QA,
+                self.model.clone(),
+                "You are a specialized QA Reviewer. Your job is to critique the work of other agents. \
+                Respond with 'PASSED' if the work is satisfactory, or provide constructive feedback if it is not.".to_string()
+            );
+
+            // Execute review
+            let prompt = format!(
+                "Review the following task implementation:\n\
+                Title: {}\n\
+                Description: {}\n\
+                Implementation Summary: {}\n\n\
+                Does this implementation satisfy the requirements? Respond with 'PASSED' or feedback.",
+                title, description, summary
+            );
+
+            let openai_key = env::var("OPENAI_API_KEY").unwrap_or_else(|_| "stub".to_string());
+            let review_result = if openai_key == "stub" {
+                "PASSED".to_string()
+            } else {
+                let client = openai::Client::new(&openai_key);
+                let agent = client.agent(&self.model)
+                    .preamble(&qa_worker.system_prompt)
+                    .build();
+                agent.prompt(&prompt).await?
+            };
+
+            if let Some(t) = context.get_task_mut(&task_id) {
+                if review_result.contains("PASSED") {
+                    t.status = TaskStatus::Completed {
+                        output_summary: summary,
+                    };
+                } else {
+                    println!("Orchestrator: Task {} failed review. Feedback: {}", task_id, review_result);
+                    t.status = TaskStatus::Pending;
+                    // We could add a way to store feedback in the task itself
+                }
             }
         }
         

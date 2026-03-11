@@ -2,21 +2,13 @@ use serde::{Deserialize, Serialize};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use crate::context::AgentRole;
+use crate::tools::ToolError;
 
 #[derive(Deserialize, Serialize)]
 pub struct SpawnAgentArgs {
     pub role: AgentRole,
     pub task_id: String,
 }
-
-#[derive(Debug)]
-pub struct ToolError(String);
-impl std::fmt::Display for ToolError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-impl std::error::Error for ToolError {}
 
 pub struct SpawnAgent;
 

@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub enum TaskStatus {
     Pending,
     InProgress(String), // Agent ID or Name
+    ReadyForReview { output_summary: String },
+    Reviewing(String),  // QA Agent ID or Name
     Completed { output_summary: String },
     Failed { error: String },
 }
@@ -78,6 +80,13 @@ impl ProjectContext {
                     .iter()
                     .all(|dep_id| self.is_task_completed(dep_id))
             })
+            .collect()
+    }
+
+    pub fn get_tasks_for_review(&self) -> Vec<&ProjectTask> {
+        self.tasks
+            .iter()
+            .filter(|task| matches!(task.status, TaskStatus::ReadyForReview { .. }))
             .collect()
     }
 }

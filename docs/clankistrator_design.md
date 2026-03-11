@@ -119,9 +119,9 @@ Agents interact with the world via `Tools`. Clankistrator uses the `Rig` library
 - [x] Implement the `spawn_agent` tool.
 
 ### Phase 3: Tooling & Execution (The Hands)
-- [ ] Implement the `FileSystemTools` (read, write, list).
-- [ ] Add basic command execution (e.g., `cargo check`).
-- [ ] Implement the `Review` loop where agents can critique each other.
+- [x] Implement the `FileSystemTools` (read, write, list).
+- [x] Add basic command execution (e.g., `cargo check`).
+- [x] Implement the `Review` loop where agents can critique each other.
 
 ### Phase 4: Refinement & UI
 - [ ] Add rich logging (using `tracing` or a specialized dashboard).
@@ -177,3 +177,13 @@ Phase 2 has implemented the core "Brain" of Clankistrator, enabling multi-agent 
 - **System Prompts**: `src/orchestrator/prompts.rs` defines the persona for the Chief Architect, providing guidance on task decomposition and review.
 - **Agent Spawning**: A `SpawnAgent` tool (`src/tools/spawn_agent.rs`) has been added as a placeholder for the Orchestrator to dynamically delegate work.
 - **End-to-End Workflow**: `src/main.rs` now orchestrates a full cycle: loading a design, bootstrapping tasks, and running a task execution iteration.
+
+## 11. Phase 3 Implementation Summary (AI Agent Reference)
+Phase 3 has added "The Hands" to Clankistrator, providing agents with the ability to interact with the file system and execute commands, along with a review loop.
+
+- **File System Tools**: `src/tools/file_system.rs` implements `ReadFile`, `WriteFile`, and `ListFiles` using `rig`'s tool abstraction. These allow agents to manipulate the codebase directly.
+- **Command Execution**: `src/tools/command_executor.rs` implements `ExecuteCommand`, enabling agents to run shell commands like `cargo check` or `cargo test` to verify their work.
+- **Worker Toolbox**: The `GenericWorker` in `src/agents/mod.rs` has been updated to include all file system and command execution tools in its toolbox.
+- **Orchestrator Toolbox**: The `Orchestrator` in `src/orchestrator/mod.rs` now includes the `SpawnAgent` tool for dynamic agent delegation.
+- **Review Loop**: The `run_iteration` loop in `Orchestrator` has been expanded to include a "Review Phase". Tasks are now moved to `ReadyForReview` after execution and then processed by a specialized QA agent.
+- **Enhanced Task States**: `src/context.rs` has been updated with new `TaskStatus` variants: `ReadyForReview` and `Reviewing`, to support the multi-stage execution and review process.

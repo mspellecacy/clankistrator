@@ -3,6 +3,7 @@ use anyhow::Result;
 use rig::completion::Prompt;
 use rig::providers::openai;
 use std::env;
+use crate::tools::{ReadFile, WriteFile, ListFiles, ExecuteCommand};
 
 pub trait Worker {
     async fn execute_task(&self, task: &ProjectTask) -> Result<TaskResult>;
@@ -41,6 +42,10 @@ impl Worker for GenericWorker {
         let client = openai::Client::new(&openai_key);
         let agent = client.agent(&self.model)
             .preamble(&self.system_prompt)
+            .tool(ReadFile)
+            .tool(WriteFile)
+            .tool(ListFiles)
+            .tool(ExecuteCommand)
             .build();
             
         let prompt = format!("Execute the following task:\nTitle: {}\nDescription: {}", task.title, task.description);
