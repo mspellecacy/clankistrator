@@ -6,7 +6,7 @@ use anyhow::Result;
 use rig::completion::Prompt;
 use rig::providers::openai;
 use std::env;
-use crate::orchestrator::prompts::ORCHESTRATOR_SYSTEM_PROMPT;
+use crate::orchestrator::prompts::{ORCHESTRATOR_SYSTEM_PROMPT, INFRASTRUCTURE_SYSTEM_PROMPT, BACKEND_SYSTEM_PROMPT, FRONTEND_SYSTEM_PROMPT, QA_SYSTEM_PROMPT};
 use crate::tools::SpawnAgent;
 
 pub struct Orchestrator {
@@ -17,6 +17,16 @@ pub struct Orchestrator {
 impl Orchestrator {
     pub fn new(model: String, design_doc: String) -> Self {
         Self { model, design_doc }
+    }
+
+    fn get_system_prompt(&self, role: &AgentRole) -> String {
+        match role {
+            AgentRole::Infrastructure => INFRASTRUCTURE_SYSTEM_PROMPT.to_string(),
+            AgentRole::Backend => BACKEND_SYSTEM_PROMPT.to_string(),
+            AgentRole::Frontend => FRONTEND_SYSTEM_PROMPT.to_string(),
+            AgentRole::QA => QA_SYSTEM_PROMPT.to_string(),
+            AgentRole::Orchestrator => ORCHESTRATOR_SYSTEM_PROMPT.to_string(),
+        }
     }
 
     /// Analyze a design document and generate an initial list of tasks
@@ -33,6 +43,7 @@ impl Orchestrator {
                     dependencies: vec![],
                     status: TaskStatus::Pending,
                     assigned_role: AgentRole::Infrastructure,
+                    feedback: None,
                 },
                 ProjectTask {
                     id: "TASK-2".into(),
@@ -41,6 +52,7 @@ impl Orchestrator {
                     dependencies: vec!["TASK-1".into()],
                     status: TaskStatus::Pending,
                     assigned_role: AgentRole::Backend,
+                    feedback: None,
                 },
             ]);
         }
@@ -48,33 +60,33 @@ impl Orchestrator {
         let client = openai::Client::new(&openai_key);
         let agent = client.agent(&self.model)
             .preamble(ORCHESTRATOR_SYSTEM_PROMPT)
-            .tool(SpawnAgent)
             .build();
             
         let prompt = format!(
             "Analyze the following design document and decompose it into a JSON list of ProjectTasks.\n\
-            Each task must have: id, title, description, dependencies (list of IDs), and assigned_role (Infrastructure, Backend, Frontend, or QA).\n\
+            Each task must have:\n\
+            - id: String (e.g., TASK-1)\n\
+            - title: String\n\
+            - description: String\n\
+            - dependencies: Vec<String> (list of IDs it depends on)\n\
+            - status: \"Pending\"\n\
+            - assigned_role: One of \"Infrastructure\", \"Backend\", \"Frontend\", \"QA\"\n\n\
+            Output ONLY raw JSON. No markdown blocks.\n\n\
             Design Document:\n{}", 
             design
         );
         
-        let _response = agent.prompt(&prompt).await?;
+        let response = agent.prompt(&prompt).await?;
         
-        // In a real implementation, we would parse JSON from the response.
-        // For this step, we'll assume the LLM might fail or return messy text,
-        // and for the sake of the exercise, we'll return a stub or attempt parsing if it looks like JSON.
+        // Attempt to parse JSON from the response
+        let tasks: Vec<ProjectTask> = if let Some(start) = response.find('[') {
+            let end = response.rfind(']').unwrap_or(response.len() - 1);
+            serde_json::from_str(&response[start..=end])?
+        } else {
+            return Err(anyhow::anyhow!("LLM response did not contain a JSON list: {}", response));
+        };
         
-        // Stub implementation for now to ensure it works
-        Ok(vec![
-            ProjectTask {
-                id: "TASK-1".into(),
-                title: "Initialize Project Structure".into(),
-                description: "Set up the basic folder structure and main.rs".into(),
-                dependencies: vec![],
-                status: TaskStatus::Pending,
-                assigned_role: AgentRole::Infrastructure,
-            },
-        ])
+        Ok(tasks)
     }
 
     pub async fn run_iteration(&self, context: &mut ProjectContext) -> Result<()> {
@@ -84,9 +96,9 @@ impl Orchestrator {
             tracing::info!("Orchestrator: Dispatching task {}", task_id);
             
             // Mark as InProgress and get task info
-            let (title, description, role) = if let Some(t) = context.get_task_mut(&task_id) {
+            let (title, description, role, feedback) = if let Some(t) = context.get_task_mut(&task_id) {
                 t.status = TaskStatus::InProgress("GenericWorker".to_string());
-                (t.title.clone(), t.description.clone(), t.assigned_role.clone())
+                (t.title.clone(), t.description.clone(), t.assigned_role.clone(), t.feedback.clone())
             } else {
                 continue;
             };
@@ -95,7 +107,7 @@ impl Orchestrator {
             let worker = GenericWorker::new(
                 role.clone(),
                 self.model.clone(),
-                format!("You are a specialized {:?} agent.", role),
+                self.get_system_prompt(&role),
                 self.design_doc.clone()
             );
 
@@ -110,9 +122,10 @@ impl Orchestrator {
                 dependencies: vec![],
                 status: TaskStatus::Pending,
                 assigned_role: role,
+                feedback,
             };
 
-            let result = worker.execute_task(&temp_task).await?;
+            let result = worker.execute_task(&temp_task, &context.working_directory.to_string_lossy()).await?;
             
             // Update context with result
             if let Some(t) = context.get_task_mut(&task_id) {
@@ -175,10 +188,11 @@ impl Orchestrator {
                         output_summary: summary,
                         feedback: None,
                     };
+                    t.feedback = None;
                 } else {
                     tracing::warn!("Orchestrator: Task {} failed review. Feedback: {}", task_id, review_result);
                     t.status = TaskStatus::Pending;
-                    // We could add a way to store feedback in the task itself
+                    t.feedback = Some(review_result);
                 }
             }
         }
@@ -221,7 +235,7 @@ impl Orchestrator {
                 if let Some(t) = context.get_task_mut(&task_id) {
                     t.status = TaskStatus::Pending;
                     tracing::info!("Orchestrator: Task {} rejected by human. Feedback: {}", task_id, feedback.trim());
-                    // We could store human feedback somewhere
+                    t.feedback = Some(feedback.trim().to_string());
                 }
             }
         }

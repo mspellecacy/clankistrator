@@ -20,8 +20,10 @@ impl Tool for ReadFile {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         tracing::debug!("Reading file: {}", args.path);
-        fs::read_to_string(&args.path)
-            .map_err(|e| ToolError(format!("Failed to read file {}: {}", args.path, e)))
+        match fs::read_to_string(&args.path) {
+            Ok(content) => Ok(content),
+            Err(e) => Ok(format!("Error reading file {}: {}", args.path, e)),
+        }
     }
 
     async fn definition(&self, _path: String) -> ToolDefinition {
@@ -60,12 +62,14 @@ impl Tool for WriteFile {
         tracing::info!("Writing file: {}", args.path);
         let path = Path::new(&args.path);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| ToolError(format!("Failed to create directory {}: {}", parent.display(), e)))?;
+            if let Err(e) = fs::create_dir_all(parent) {
+                return Ok(format!("Failed to create directory {}: {}", parent.display(), e));
+            }
         }
-        fs::write(&args.path, &args.content)
-            .map_err(|e| ToolError(format!("Failed to write to file {}: {}", args.path, e)))?;
-        Ok(format!("Successfully wrote to {}", args.path))
+        match fs::write(&args.path, &args.content) {
+            Ok(_) => Ok(format!("Successfully wrote to {}", args.path)),
+            Err(e) => Ok(format!("Failed to write to file {}: {}", args.path, e)),
+        }
     }
 
     async fn definition(&self, _path: String) -> ToolDefinition {

@@ -20,19 +20,25 @@ impl Tool for ExecuteCommand {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         tracing::info!("Executing command: {} {:?}", args.command, args.args);
-        let output = Command::new(&args.command)
+        let output_res = Command::new(&args.command)
             .args(&args.args)
             .output()
-            .await
-            .map_err(|e| ToolError(format!("Failed to execute command {} {:?}: {}", args.command, args.args, e)))?;
+            .await;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        match output_res {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-        if output.status.success() {
-            Ok(format!("Command executed successfully.\nStdout:\n{}\nStderr:\n{}", stdout, stderr))
-        } else {
-            Err(ToolError(format!("Command failed with exit code {:?}.\nStdout:\n{}\nStderr:\n{}", output.status.code(), stdout, stderr)))
+                if output.status.success() {
+                    Ok(format!("Command executed successfully.\nStdout:\n{}\nStderr:\n{}", stdout, stderr))
+                } else {
+                    Ok(format!("Command failed with exit code {:?}.\nStdout:\n{}\nStderr:\n{}", output.status.code(), stdout, stderr))
+                }
+            }
+            Err(e) => {
+                Ok(format!("Failed to execute command {} {:?}: {}", args.command, args.args, e))
+            }
         }
     }
 

@@ -1,99 +1,91 @@
-mod context;
-mod orchestrator;
-mod agents;
-mod tools;
-mod parser;
+pub mod context;
+pub mod agents;
+pub mod orchestrator;
+pub mod tools;
+pub mod parser;
 
+use std::path::PathBuf;
 use clap::Parser;
-use anyhow::Result;
 use dotenvy::dotenv;
-use std::env;
-use parser::MarkdownParser;
-use rig::completion::Prompt;
 use crate::context::ProjectContext;
 use crate::orchestrator::Orchestrator;
-use std::path::PathBuf;
+use anyhow::Result;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Path to the markdown design document
     #[arg(short, long)]
-    design: String,
+    design: PathBuf,
 
-    /// Working directory for the project implementation
-    #[arg(short, long, default_value = ".")]
-    output: String,
+    #[arg(short, long)]
+    output: PathBuf,
+
+    #[arg(short, long, default_value = "gpt-4o")]
+    model: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load environment variables from .env.local if it exists
     dotenvy::from_filename(".env.local").ok();
-    // Load .env file
-    dotenv().ok();
-
-    // Initialize logging
+    dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
-    
-    // Parse CLI arguments
+
     let args = Args::parse();
-    
-    tracing::info!("Clankistrator: Initializing AI Orchestration");
-    tracing::info!("Design Doc: {}", args.design);
-    tracing::info!("Output Path: {}", args.output);
 
-    // Load design doc
-    let design_content = std::fs::read_to_string(&args.design)?;
-    
-    // Parse markdown sections
-    let sections = MarkdownParser::parse_sections(&design_content);
-    tracing::info!("Found {} sections in design document.", sections.len());
-
-    // Summarize document using LLM (Hello World task)
-    summarize_document(&design_content).await?;
-
-    // Initialize ProjectContext
-    let mut context = ProjectContext::new(
-        "Clankistrator Project".into(),
-        PathBuf::from(&args.output)
-    );
-
-    // Initialize Orchestrator
-    let orchestrator = Orchestrator::new("gpt-4o".into(), design_content.clone());
-
-    tracing::info!("Orchestrator: Bootstrapping project from design doc...");
-    let initial_tasks = orchestrator.bootstrap_project(&design_content).await?;
-    context.tasks = initial_tasks;
-    tracing::info!("Found {} initial tasks.", context.tasks.len());
-
-    // Run first iteration
-    tracing::info!("Orchestrator: Running first iteration...");
-    orchestrator.run_iteration(&mut context).await?;
-
-    tracing::info!("Phase 4 implementation progress: Rich logging added.");
-
-    Ok(())
-}
-
-async fn summarize_document(content: &str) -> Result<()> {
-    tracing::info!("--- Document Summary (via LLM) ---");
-    
-    let openai_key = env::var("OPENAI_API_KEY").unwrap_or_else(|_| "stub".to_string());
-    
-    if openai_key == "stub" {
-        tracing::info!("(No OPENAI_API_KEY found, skipping real LLM call)");
-        tracing::info!("Content length: {} bytes", content.len());
-        return Ok(());
+    if !args.design.exists() {
+        anyhow::bail!("Design file not found: {:?}", args.design);
     }
 
-    // Attempting to use rig-core API (0.7.0)
-    let client = rig::providers::openai::Client::new(&openai_key);
-    let agent = client.agent("gpt-4o")
-        .preamble("Summarize the following design document concisely.")
-        .build();
-    let response = agent.prompt(content).await?;
-    tracing::info!("{}", response);
+    if !args.output.exists() {
+        std::fs::create_dir_all(&args.output)?;
+    }
+
+    let design_content = std::fs::read_to_string(&args.design)?;
+    let project_name = args.design
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("New Project")
+        .to_string();
+
+    let mut context = ProjectContext::new(project_name, args.output.clone());
+    let orchestrator = Orchestrator::new(args.model, design_content.clone());
+
+    tracing::info!("Clankistrator: Starting orchestration for project {:?}", context.project_name);
+
+    // 1. Bootstrap Phase
+    let initial_tasks = orchestrator.bootstrap_project(&design_content).await?;
+    context.tasks = initial_tasks;
+
+    tracing::info!("Clankistrator: Bootstrapped with {} initial tasks", context.tasks.len());
+
+    // 2. Execution Phase
+    // For now, let's run a few iterations to demonstrate the process.
+    // In a real scenario, this would loop until all tasks are completed.
+    for i in 1..=15 {
+        tracing::info!("Clankistrator: Starting iteration {}", i);
+        orchestrator.run_iteration(&mut context).await?;
+        
+        let completed_count = context.tasks.iter().filter(|t| matches!(t.status, crate::context::TaskStatus::Completed { .. })).count();
+        if completed_count == context.tasks.len() {
+            tracing::info!("Clankistrator: All tasks completed!");
+            break;
+        }
+    }
+
+    println!("\n--- ORCHESTRATION SUMMARY ---");
+    println!("Project: {}", context.project_name);
+    for task in &context.tasks {
+        let status = match &task.status {
+            crate::context::TaskStatus::Completed { .. } => "✅ Completed",
+            crate::context::TaskStatus::Failed { error } => &format!("❌ Failed: {}", error),
+            crate::context::TaskStatus::Pending => "⏳ Pending",
+            crate::context::TaskStatus::InProgress(_) => "🔄 In Progress",
+            crate::context::TaskStatus::ReadyForReview { .. } => "👀 Ready for Review",
+            crate::context::TaskStatus::Reviewing(_) => "🔍 Reviewing",
+            crate::context::TaskStatus::RequiresHumanApproval { .. } => "👤 Waiting for Approval",
+        };
+        println!("Task {}: {} - {}", task.id, task.title, status);
+    }
 
     Ok(())
 }

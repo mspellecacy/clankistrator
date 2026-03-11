@@ -29,6 +29,7 @@ pub struct ProjectTask {
     pub dependencies: Vec<String>,
     pub status: TaskStatus,
     pub assigned_role: AgentRole,
+    pub feedback: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -113,6 +114,7 @@ mod tests {
             dependencies: vec![],
             status: TaskStatus::Pending,
             assigned_role: AgentRole::Backend,
+            feedback: None,
         });
         context.tasks.push(ProjectTask {
             id: "TASK-2".into(),
@@ -121,6 +123,7 @@ mod tests {
             dependencies: vec!["TASK-1".into()],
             status: TaskStatus::Pending,
             assigned_role: AgentRole::Frontend,
+            feedback: None,
         });
 
         let ready = context.get_ready_tasks();
