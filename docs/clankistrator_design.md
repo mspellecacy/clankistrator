@@ -124,9 +124,9 @@ Agents interact with the world via `Tools`. Clankistrator uses the `Rig` library
 - [x] Implement the `Review` loop where agents can critique each other.
 
 ### Phase 4: Refinement & UI
-- [ ] Add rich logging (using `tracing` or a specialized dashboard).
-- [ ] Support for external vector stores (RAG) for very large design documents.
-- [ ] Support for "Human in the Loop" (HITL) for critical decision points.
+- [x] Add rich logging (using `tracing` or a specialized dashboard).
+- [x] Support for external vector stores (RAG) for very large design documents.
+- [x] Support for "Human in the Loop" (HITL) for critical decision points.
 
 ## 7. Project Structure (Final Target)
 ```text
@@ -187,3 +187,12 @@ Phase 3 has added "The Hands" to Clankistrator, providing agents with the abilit
 - **Orchestrator Toolbox**: The `Orchestrator` in `src/orchestrator/mod.rs` now includes the `SpawnAgent` tool for dynamic agent delegation.
 - **Review Loop**: The `run_iteration` loop in `Orchestrator` has been expanded to include a "Review Phase". Tasks are now moved to `ReadyForReview` after execution and then processed by a specialized QA agent.
 - **Enhanced Task States**: `src/context.rs` has been updated with new `TaskStatus` variants: `ReadyForReview` and `Reviewing`, to support the multi-stage execution and review process.
+
+## 12. Phase 4 Implementation Summary (AI Agent Reference)
+Phase 4 has focused on "Refinement & UI", adding logging, RAG-like document querying, and Human-in-the-Loop (HITL) capabilities.
+
+- **Rich Logging**: Replaced `println!` with `tracing` macros across the codebase. `tracing-subscriber` is initialized in `main.rs`, providing structured logging.
+- **RAG Support**: Implemented a `QueryDesignDoc` tool in `src/tools/rag.rs`. This allows agents to search for relevant information within large design documents using a simplified retrieval mechanism.
+- **Human in the Loop (HITL)**: Added a `RequiresHumanApproval` status to `ProjectTask`. The `Orchestrator` now has a dedicated phase that pauses and waits for user input before marking a task as `Completed`.
+- **Integrated Toolbox**: `GenericWorker` now includes the `QueryDesignDoc` tool and has access to the design document content for more accurate task execution.
+- **Improved Orchestrator**: The orchestrator loop now includes three distinct phases: Dispatching, Reviewing, and Approval.

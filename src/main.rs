@@ -39,16 +39,16 @@ async fn main() -> Result<()> {
     // Parse CLI arguments
     let args = Args::parse();
     
-    println!("Clankistrator: Initializing AI Orchestration");
-    println!("Design Doc: {}", args.design);
-    println!("Output Path: {}", args.output);
+    tracing::info!("Clankistrator: Initializing AI Orchestration");
+    tracing::info!("Design Doc: {}", args.design);
+    tracing::info!("Output Path: {}", args.output);
 
     // Load design doc
     let design_content = std::fs::read_to_string(&args.design)?;
     
     // Parse markdown sections
     let sections = MarkdownParser::parse_sections(&design_content);
-    println!("Found {} sections in design document.", sections.len());
+    tracing::info!("Found {} sections in design document.", sections.len());
 
     // Summarize document using LLM (Hello World task)
     summarize_document(&design_content).await?;
@@ -60,30 +60,30 @@ async fn main() -> Result<()> {
     );
 
     // Initialize Orchestrator
-    let orchestrator = Orchestrator::new("gpt-4o".into());
+    let orchestrator = Orchestrator::new("gpt-4o".into(), design_content.clone());
 
-    println!("Orchestrator: Bootstrapping project from design doc...");
+    tracing::info!("Orchestrator: Bootstrapping project from design doc...");
     let initial_tasks = orchestrator.bootstrap_project(&design_content).await?;
     context.tasks = initial_tasks;
-    println!("Found {} initial tasks.", context.tasks.len());
+    tracing::info!("Found {} initial tasks.", context.tasks.len());
 
     // Run first iteration
-    println!("Orchestrator: Running first iteration...");
+    tracing::info!("Orchestrator: Running first iteration...");
     orchestrator.run_iteration(&mut context).await?;
 
-    println!("Phase 2 verification completed successfully.");
+    tracing::info!("Phase 4 implementation progress: Rich logging added.");
 
     Ok(())
 }
 
 async fn summarize_document(content: &str) -> Result<()> {
-    println!("--- Document Summary (via LLM) ---");
+    tracing::info!("--- Document Summary (via LLM) ---");
     
     let openai_key = env::var("OPENAI_API_KEY").unwrap_or_else(|_| "stub".to_string());
     
     if openai_key == "stub" {
-        println!("(No OPENAI_API_KEY found, skipping real LLM call)");
-        println!("Content length: {} bytes", content.len());
+        tracing::info!("(No OPENAI_API_KEY found, skipping real LLM call)");
+        tracing::info!("Content length: {} bytes", content.len());
         return Ok(());
     }
 
@@ -93,7 +93,7 @@ async fn summarize_document(content: &str) -> Result<()> {
         .preamble("Summarize the following design document concisely.")
         .build();
     let response = agent.prompt(content).await?;
-    println!("{}", response);
+    tracing::info!("{}", response);
 
     Ok(())
 }

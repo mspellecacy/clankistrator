@@ -19,6 +19,7 @@ impl Tool for ExecuteCommand {
     type Output = String;
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        tracing::info!("Executing command: {} {:?}", args.command, args.args);
         let output = Command::new(&args.command)
             .args(&args.args)
             .output()

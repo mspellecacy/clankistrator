@@ -7,6 +7,7 @@ pub enum TaskStatus {
     InProgress(String), // Agent ID or Name
     ReadyForReview { output_summary: String },
     Reviewing(String),  // QA Agent ID or Name
+    RequiresHumanApproval { output_summary: String, feedback: Option<String> },
     Completed { output_summary: String },
     Failed { error: String },
 }
@@ -87,6 +88,13 @@ impl ProjectContext {
         self.tasks
             .iter()
             .filter(|task| matches!(task.status, TaskStatus::ReadyForReview { .. }))
+            .collect()
+    }
+
+    pub fn get_tasks_for_approval(&self) -> Vec<&ProjectTask> {
+        self.tasks
+            .iter()
+            .filter(|task| matches!(task.status, TaskStatus::RequiresHumanApproval { .. }))
             .collect()
     }
 }

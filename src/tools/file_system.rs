@@ -19,6 +19,7 @@ impl Tool for ReadFile {
     type Output = String;
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        tracing::debug!("Reading file: {}", args.path);
         fs::read_to_string(&args.path)
             .map_err(|e| ToolError(format!("Failed to read file {}: {}", args.path, e)))
     }
@@ -56,6 +57,7 @@ impl Tool for WriteFile {
     type Output = String;
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        tracing::info!("Writing file: {}", args.path);
         let path = Path::new(&args.path);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)

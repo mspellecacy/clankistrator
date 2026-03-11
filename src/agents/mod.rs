@@ -3,7 +3,7 @@ use anyhow::Result;
 use rig::completion::Prompt;
 use rig::providers::openai;
 use std::env;
-use crate::tools::{ReadFile, WriteFile, ListFiles, ExecuteCommand};
+use crate::tools::{ReadFile, WriteFile, ListFiles, ExecuteCommand, QueryDesignDoc};
 
 pub trait Worker {
     async fn execute_task(&self, task: &ProjectTask) -> Result<TaskResult>;
@@ -13,14 +13,16 @@ pub struct GenericWorker {
     pub role: AgentRole,
     pub model: String,
     pub system_prompt: String,
+    pub design_doc: String,
 }
 
 impl GenericWorker {
-    pub fn new(role: AgentRole, model: String, system_prompt: String) -> Self {
+    pub fn new(role: AgentRole, model: String, system_prompt: String, design_doc: String) -> Self {
         Self {
             role,
             model,
             system_prompt,
+            design_doc,
         }
     }
 }
@@ -46,6 +48,7 @@ impl Worker for GenericWorker {
             .tool(WriteFile)
             .tool(ListFiles)
             .tool(ExecuteCommand)
+            .tool(QueryDesignDoc { design_content: self.design_doc.clone() })
             .build();
             
         let prompt = format!("Execute the following task:\nTitle: {}\nDescription: {}", task.title, task.description);

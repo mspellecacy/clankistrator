@@ -15,3 +15,6 @@ pub use file_system::{ReadFile, WriteFile, ListFiles};
 
 pub mod command_executor;
 pub use command_executor::ExecuteCommand;
+
+pub mod rag;
+pub use rag::QueryDesignDoc;

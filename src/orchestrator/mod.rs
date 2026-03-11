@@ -11,11 +11,12 @@ use crate::tools::SpawnAgent;
 
 pub struct Orchestrator {
     pub model: String,
+    pub design_doc: String,
 }
 
 impl Orchestrator {
-    pub fn new(model: String) -> Self {
-        Self { model }
+    pub fn new(model: String, design_doc: String) -> Self {
+        Self { model, design_doc }
     }
 
     /// Analyze a design document and generate an initial list of tasks
@@ -57,7 +58,7 @@ impl Orchestrator {
             design
         );
         
-        let response = agent.prompt(&prompt).await?;
+        let _response = agent.prompt(&prompt).await?;
         
         // In a real implementation, we would parse JSON from the response.
         // For this step, we'll assume the LLM might fail or return messy text,
@@ -80,7 +81,7 @@ impl Orchestrator {
         let ready_task_ids: Vec<String> = context.get_ready_tasks().iter().map(|t| t.id.clone()).collect();
         
         for task_id in ready_task_ids {
-            println!("Orchestrator: Dispatching task {}", task_id);
+            tracing::info!("Orchestrator: Dispatching task {}", task_id);
             
             // Mark as InProgress and get task info
             let (title, description, role) = if let Some(t) = context.get_task_mut(&task_id) {
@@ -94,7 +95,8 @@ impl Orchestrator {
             let worker = GenericWorker::new(
                 role.clone(),
                 self.model.clone(),
-                format!("You are a specialized {:?} agent.", role)
+                format!("You are a specialized {:?} agent.", role),
+                self.design_doc.clone()
             );
 
             // Execute the task - We need a temporary ProjectTask to pass to execute_task
@@ -123,7 +125,7 @@ impl Orchestrator {
         // 2. Review Phase
         let review_task_ids: Vec<String> = context.get_tasks_for_review().iter().map(|t| t.id.clone()).collect();
         for task_id in review_task_ids {
-            println!("Orchestrator: Dispatching task {} for review", task_id);
+            tracing::info!("Orchestrator: Dispatching task {} for review", task_id);
 
             let (title, description, summary) = if let Some(t) = context.get_task_mut(&task_id) {
                 if let TaskStatus::ReadyForReview { output_summary } = &t.status {
@@ -141,7 +143,8 @@ impl Orchestrator {
                 AgentRole::QA,
                 self.model.clone(),
                 "You are a specialized QA Reviewer. Your job is to critique the work of other agents. \
-                Respond with 'PASSED' if the work is satisfactory, or provide constructive feedback if it is not.".to_string()
+                Respond with 'PASSED' if the work is satisfactory, or provide constructive feedback if it is not.".to_string(),
+                self.design_doc.clone()
             );
 
             // Execute review
@@ -167,13 +170,58 @@ impl Orchestrator {
 
             if let Some(t) = context.get_task_mut(&task_id) {
                 if review_result.contains("PASSED") {
+                    tracing::info!("Orchestrator: Task {} passed review. Moving to human approval.", task_id);
+                    t.status = TaskStatus::RequiresHumanApproval {
+                        output_summary: summary,
+                        feedback: None,
+                    };
+                } else {
+                    tracing::warn!("Orchestrator: Task {} failed review. Feedback: {}", task_id, review_result);
+                    t.status = TaskStatus::Pending;
+                    // We could add a way to store feedback in the task itself
+                }
+            }
+        }
+
+        // 3. Human in the Loop Phase
+        let approval_task_ids: Vec<String> = context.get_tasks_for_approval().iter().map(|t| t.id.clone()).collect();
+        for task_id in approval_task_ids {
+            tracing::info!("Orchestrator: Waiting for human approval for task {}", task_id);
+
+            let summary = if let Some(t) = context.get_task(&task_id) {
+                if let TaskStatus::RequiresHumanApproval { output_summary, .. } = &t.status {
+                    output_summary.clone()
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
+
+            println!("\n--- HUMAN APPROVAL REQUIRED ---");
+            println!("Task: {}", task_id);
+            println!("Summary: {}", summary);
+            println!("Approve? (y/n): ");
+
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+
+            if input.trim().to_lowercase() == "y" {
+                if let Some(t) = context.get_task_mut(&task_id) {
                     t.status = TaskStatus::Completed {
                         output_summary: summary,
                     };
-                } else {
-                    println!("Orchestrator: Task {} failed review. Feedback: {}", task_id, review_result);
+                    tracing::info!("Orchestrator: Task {} approved by human.", task_id);
+                }
+            } else {
+                println!("Provide feedback for the agent: ");
+                let mut feedback = String::new();
+                std::io::stdin().read_line(&mut feedback)?;
+                
+                if let Some(t) = context.get_task_mut(&task_id) {
                     t.status = TaskStatus::Pending;
-                    // We could add a way to store feedback in the task itself
+                    tracing::info!("Orchestrator: Task {} rejected by human. Feedback: {}", task_id, feedback.trim());
+                    // We could store human feedback somewhere
                 }
             }
         }
