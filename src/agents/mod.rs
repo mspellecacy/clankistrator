@@ -1,7 +1,8 @@
 use crate::context::{ProjectTask, TaskResult, AgentRole};
 use anyhow::Result;
-use rig::completion::Prompt;
+use rig::prelude::*;
 use rig::providers::openai;
+use rig::completion::Prompt;
 use std::env;
 use crate::tools::{ReadFile, WriteFile, ListFiles, ExecuteCommand, QueryDesignDoc};
 
@@ -14,15 +15,17 @@ pub struct GenericWorker {
     pub model: String,
     pub system_prompt: String,
     pub design_doc: String,
+    pub max_turns: usize,
 }
 
 impl GenericWorker {
-    pub fn new(role: AgentRole, model: String, system_prompt: String, design_doc: String) -> Self {
+    pub fn new(role: AgentRole, model: String, system_prompt: String, design_doc: String, max_turns: usize) -> Self {
         Self {
             role,
             model,
             system_prompt,
             design_doc,
+            max_turns,
         }
     }
 }
@@ -34,14 +37,14 @@ impl Worker for GenericWorker {
         if openai_key == "stub" {
             return Ok(TaskResult {
                 task_id: task.id.clone(),
-                status: "Completed".to_string(),
+                status: "Failed".to_string(),
                 summary: format!("STUB implementation for {} by GenericWorker ({:?})", task.title, self.role),
                 files_created: vec![],
-                feedback: Some("No OPENAI_API_KEY found, used stub.".to_string()),
+                feedback: Some("No OPENAI_API_KEY found, used stub. Please provide an OPENAI_API_KEY in .env.local.".to_string()),
             });
         }
 
-        let client = openai::Client::new(&openai_key);
+        let client = openai::Client::new(&openai_key)?;
         let preamble = format!(
             "{}\n\
             You are currently working in the directory: {}.\n\
@@ -68,7 +71,7 @@ impl Worker for GenericWorker {
             - After you are done, respond with a JSON object containing:\n\
               - summary: String (detailed description of what you did)\n\
               - files_created: Vec<String> (list of files you created or modified)\n\n\
-            Output ONLY the raw JSON object.", 
+            Output ONLY the raw JSON object. If you use markdown, use ```json blocks.", 
             task.title, task.description, working_directory
         );
 
@@ -82,32 +85,62 @@ impl Worker for GenericWorker {
             );
         }
 
-        let response = agent.prompt(&prompt).await?;
+        tracing::info!("Agent ({:?}): Prompting LLM for task: {}", self.role, task.id);
+        let response: String = agent.prompt(&prompt)
+            .max_turns(self.max_turns)
+            .await?;
+        tracing::debug!("Agent ({:?}): LLM response: {}", self.role, response);
 
         // Attempt to parse JSON from the response
-        let result: TaskResult = if let Some(start) = response.find('{') {
+        let json_str = if let Some(start) = response.find("```json") {
+            let rest = &response[start + 7..];
+            if let Some(end) = rest.find("```") {
+                &rest[..end]
+            } else {
+                &response[start + 7..]
+            }
+        } else if let Some(start) = response.find('{') {
             let end = response.rfind('}').unwrap_or(response.len() - 1);
-            let json_str = &response[start..=end];
-            let parsed: serde_json::Value = serde_json::from_str(json_str)?;
-            TaskResult {
-                task_id: task.id.clone(),
-                status: "Completed".to_string(),
-                summary: parsed["summary"].as_str().unwrap_or(&response).to_string(),
-                files_created: parsed["files_created"]
-                    .as_array()
-                    .unwrap_or(&vec![])
-                    .iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect(),
-                feedback: None,
+            &response[start..=end]
+        } else {
+            ""
+        };
+
+        let result: TaskResult = if !json_str.is_empty() {
+            match serde_json::from_str::<serde_json::Value>(json_str.trim()) {
+                Ok(parsed) => {
+                    TaskResult {
+                        task_id: task.id.clone(),
+                        status: "Completed".to_string(),
+                        summary: parsed["summary"].as_str().unwrap_or(&response).to_string(),
+                        files_created: parsed["files_created"]
+                            .as_array()
+                            .unwrap_or(&vec![])
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect(),
+                        feedback: None,
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Agent ({:?}): Failed to parse JSON from response: {}. Using raw response as failure.", self.role, e);
+                    TaskResult {
+                        task_id: task.id.clone(),
+                        status: "Failed".to_string(),
+                        summary: format!("Failed to parse JSON: {}. Raw response: {}", e, response),
+                        files_created: vec![],
+                        feedback: Some(format!("The agent failed to provide a valid JSON response: {}", e)),
+                    }
+                }
             }
         } else {
+            tracing::warn!("Agent ({:?}): No JSON object found in response. Using raw response as failure.", self.role);
             TaskResult {
                 task_id: task.id.clone(),
-                status: "Completed".to_string(),
-                summary: response,
+                status: "Failed".to_string(),
+                summary: format!("No JSON found in response: {}", response),
                 files_created: vec![],
-                feedback: None,
+                feedback: Some("The agent failed to provide a structured JSON response.".to_string()),
             }
         };
 

@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
 pub enum TaskStatus {
+    #[serde(alias = "pending", alias = "PENDING")]
     Pending,
     InProgress(String), // Agent ID or Name
     ReadyForReview { output_summary: String },
@@ -13,11 +15,16 @@ pub enum TaskStatus {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
 pub enum AgentRole {
     Orchestrator,
+    #[serde(alias = "infrastructure", alias = "INFRASTRUCTURE")]
     Infrastructure,
+    #[serde(alias = "backend", alias = "BACKEND")]
     Backend,
+    #[serde(alias = "frontend", alias = "FRONTEND")]
     Frontend,
+    #[serde(alias = "qa", alias = "QA")]
     QA,
 }
 
@@ -46,14 +53,22 @@ pub struct ProjectContext {
     pub project_name: String,
     pub tasks: Vec<ProjectTask>,
     pub working_directory: PathBuf,
+    pub token_usage: u64,
+    pub total_cost: f64,
+    pub max_steps: usize,
+    pub brave_mode: bool,
 }
 
 impl ProjectContext {
-    pub fn new(name: String, output_dir: PathBuf) -> Self {
+    pub fn new(name: String, output_dir: PathBuf, max_steps: usize, brave_mode: bool) -> Self {
         Self {
             project_name: name,
             tasks: Vec::new(),
             working_directory: output_dir,
+            token_usage: 0,
+            total_cost: 0.0,
+            max_steps,
+            brave_mode,
         }
     }
 
@@ -106,7 +121,7 @@ mod tests {
 
     #[test]
     fn test_get_ready_tasks() {
-        let mut context = ProjectContext::new("Test".into(), PathBuf::from("."));
+        let mut context = ProjectContext::new("Test".into(), PathBuf::from("."), 50, false);
         context.tasks.push(ProjectTask {
             id: "TASK-1".into(),
             title: "Task 1".into(),

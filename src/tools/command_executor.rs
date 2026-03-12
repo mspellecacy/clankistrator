@@ -45,7 +45,7 @@ impl Tool for ExecuteCommand {
     async fn definition(&self, _path: String) -> ToolDefinition {
         serde_json::from_value(serde_json::json!({
             "name": "execute_command",
-            "description": "Execute a shell command and return its output.",
+            "description": "Execute a shell command and return its output. Use this for building and testing the project. PREFER `cargo` for Rust projects. Avoid using scripting languages like Python or Bash unless absolutely necessary.",
             "parameters": {
                 "type": "object",
                 "properties": {

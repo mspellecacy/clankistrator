@@ -128,6 +128,14 @@ Agents interact with the world via `Tools`. Clankistrator uses the `Rig` library
 - [x] Support for external vector stores (RAG) for very large design documents.
 - [x] Support for "Human in the Loop" (HITL) for critical decision points.
 
+### Phase 5: TUI Management Dashboard (The Observer)
+- [x] Implement a real-time TUI using `ratatui` for system monitoring.
+- [x] **State Visualization**: Dynamic display of the `TaskGraph` and individual task progress.
+- [x] **Log Streaming**: Integrated view for `tracing` logs from both Orchestrator and Workers.
+- [x] **Interactive HITL**: A dedicated TUI pane for providing human feedback and approvals.
+- [x] **Resource Monitoring**: Track token usage and estimated costs in real-time.
+- [x] **Brave Mode**: Allow the orchestrator to run fully autonomously without human intervention.
+
 ## 7. Project Structure (Final Target)
 ```text
 clankistrator/
@@ -146,9 +154,12 @@ clankistrator/
 │   │   ├── mod.rs
 │   │   ├── file_system.rs
 │   │   └── command_executor.rs
-│   └── parser/                 # Design doc parsing logic
+│   ├── parser/                 # Design doc parsing logic
+│   │   ├── mod.rs
+│   │   └── markdown.rs
+│   └── tui/                    # Terminal User Interface (Dashboard)
 │       ├── mod.rs
-│       └── markdown.rs
+│       └── views.rs
 └── docs/
     └── design.md               # This document
 ```
@@ -196,3 +207,14 @@ Phase 4 has focused on "Refinement & UI", adding logging, RAG-like document quer
 - **Human in the Loop (HITL)**: Added a `RequiresHumanApproval` status to `ProjectTask`. The `Orchestrator` now has a dedicated phase that pauses and waits for user input before marking a task as `Completed`.
 - **Integrated Toolbox**: `GenericWorker` now includes the `QueryDesignDoc` tool and has access to the design document content for more accurate task execution.
 - **Improved Orchestrator**: The orchestrator loop now includes three distinct phases: Dispatching, Reviewing, and Approval.
+
+## 13. Phase 5 Implementation Summary (AI Agent Reference)
+Phase 5 has introduced a comprehensive TUI dashboard for real-time project monitoring and orchestration control.
+
+- **Real-time TUI**: Developed using `ratatui` and `crossterm`, providing a multi-tabbed interface for Tasks, Logs, HITL, and Stats.
+- **State Visualization**: The `Tasks` tab provides a live view of the `ProjectContext`, showing task statuses (Pending, In Progress, Completed, etc.) and IDs.
+- **Log Streaming**: Integrated `tui-logger` to capture `tracing` output from both the Orchestrator and worker agents, displayed in a dedicated `Logs` tab.
+- **Interactive HITL**: A specialized `HITL` tab allows users to review tasks requiring human approval and approve them directly from the TUI (using 'a' key).
+- **Resource Tracking**: Added simulated token usage and cost monitoring to the `Stats` tab, allowing for budget oversight.
+- **Brave Mode & TUI Integration**: Added `--brave`, `--tui`, and `--max-steps` CLI flags. "Brave Mode" enables full autonomy by bypassing HITL approvals. `--max-steps` (default: 50) controls the orchestration limit, with 0 for unlimited.
+- **Shared State Architecture**: Used `Arc<Mutex<ProjectContext>>` to synchronize state between the background Orchestrator thread and the TUI event loop.
