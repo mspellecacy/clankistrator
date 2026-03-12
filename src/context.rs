@@ -57,10 +57,11 @@ pub struct ProjectContext {
     pub total_cost: f64,
     pub max_steps: usize,
     pub brave_mode: bool,
+    pub model: String,
 }
 
 impl ProjectContext {
-    pub fn new(name: String, output_dir: PathBuf, max_steps: usize, brave_mode: bool) -> Self {
+    pub fn new(name: String, output_dir: PathBuf, max_steps: usize, brave_mode: bool, model: String) -> Self {
         Self {
             project_name: name,
             tasks: Vec::new(),
@@ -69,6 +70,7 @@ impl ProjectContext {
             total_cost: 0.0,
             max_steps,
             brave_mode,
+            model,
         }
     }
 
@@ -121,7 +123,7 @@ mod tests {
 
     #[test]
     fn test_get_ready_tasks() {
-        let mut context = ProjectContext::new("Test".into(), PathBuf::from("."), 50, false);
+        let mut context = ProjectContext::new("Test".into(), PathBuf::from("."), 50, false, "gpt-4o".to_string());
         context.tasks.push(ProjectTask {
             id: "TASK-1".into(),
             title: "Task 1".into(),

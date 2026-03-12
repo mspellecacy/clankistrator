@@ -136,6 +136,12 @@ Agents interact with the world via `Tools`. Clankistrator uses the `Rig` library
 - [x] **Resource Monitoring**: Track token usage and estimated costs in real-time.
 - [x] **Brave Mode**: Allow the orchestrator to run fully autonomously without human intervention.
 
+### Phase 6: CLI to TUI Migration (TUI-First)
+- [x] **Default TUI Mode**: Change the default behavior to start in TUI mode without requiring the `--tui` flag.
+- [x] **Headless Mode**: Introduce a `--headless` flag to allow running in the traditional CLI mode.
+- [x] **Defaulted CLI Options**: Make `design` and `output` arguments optional, defaulting to `design.md` and `./output` respectively.
+- [x] **TUI Settings Menu**: Enhance the TUI to allow real-time adjustment of orchestration parameters (e.g., model, max steps, brave mode) through an interactive menu.
+
 ## 7. Project Structure (Final Target)
 ```text
 clankistrator/
@@ -216,5 +222,13 @@ Phase 5 has introduced a comprehensive TUI dashboard for real-time project monit
 - **Log Streaming**: Integrated `tui-logger` to capture `tracing` output from both the Orchestrator and worker agents, displayed in a dedicated `Logs` tab.
 - **Interactive HITL**: A specialized `HITL` tab allows users to review tasks requiring human approval and approve them directly from the TUI (using 'a' key).
 - **Resource Tracking**: Added simulated token usage and cost monitoring to the `Stats` tab, allowing for budget oversight.
-- **Brave Mode & TUI Integration**: Added `--brave`, `--tui`, and `--max-steps` CLI flags. "Brave Mode" enables full autonomy by bypassing HITL approvals. `--max-steps` (default: 50) controls the orchestration limit, with 0 for unlimited.
+- **Brave Mode & TUI Integration**: Added `--brave`, `--headless`, and `--max-steps` CLI flags. "Brave Mode" enables full autonomy by bypassing HITL approvals. `--max-steps` (default: 50) controls the orchestration limit, with 0 for unlimited.
 - **Shared State Architecture**: Used `Arc<Mutex<ProjectContext>>` to synchronize state between the background Orchestrator thread and the TUI event loop.
+
+## 14. Phase 6 Implementation Summary (AI Agent Reference)
+Phase 6 has migrated Clankistrator to a TUI-first architecture, making the terminal dashboard the default entry point and improving configuration flexibility.
+
+- **TUI-First Default**: The application now starts in TUI mode by default. The `--tui` flag has been removed in favor of a `--headless` flag for traditional CLI execution.
+- **Defaulted CLI Arguments**: `design` and `output` parameters are now optional, defaulting to `design.md` and `output/` respectively, allowing for a zero-arg startup in many cases.
+- **Dynamic Configuration**: Added the ability to adjust `Brave Mode`, `Model`, and `Max Steps` at runtime via an interactive configuration modal in the TUI (accessible via 'm').
+- **Shared State Orchestration**: The `Orchestrator` now dynamically reads configuration values (model, max_steps) from the shared `ProjectContext` during each execution iteration, ensuring TUI adjustments take effect immediately.

@@ -8,7 +8,6 @@ impl std::fmt::Display for ToolError {
 impl std::error::Error for ToolError {}
 
 pub mod spawn_agent;
-pub use spawn_agent::SpawnAgent;
 
 pub mod file_system;
 pub use file_system::{ReadFile, WriteFile, ListFiles};

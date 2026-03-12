@@ -114,9 +114,13 @@ impl Orchestrator {
     }
 
     pub async fn run_iteration(&self, context: Arc<Mutex<ProjectContext>>) -> Result<()> {
-        let ready_task_ids: Vec<String> = {
+        let (ready_task_ids, model, max_steps) = {
             let ctx = context.lock().await;
-            ctx.get_ready_tasks().iter().map(|t| t.id.clone()).collect()
+            (
+                ctx.get_ready_tasks().iter().map(|t| t.id.clone()).collect::<Vec<String>>(),
+                ctx.model.clone(),
+                ctx.max_steps,
+            )
         };
         
         for task_id in ready_task_ids {
@@ -137,10 +141,10 @@ impl Orchestrator {
             // Create a worker based on the role
             let worker = GenericWorker::new(
                 role.clone(),
-                self.model.clone(),
+                model.clone(),
                 self.get_system_prompt(&role),
                 self.design_doc.clone(),
-                if self.max_steps == 0 { 1000 } else { self.max_steps }
+                if max_steps == 0 { 1000 } else { max_steps }
             );
 
             // Execute the task
@@ -199,10 +203,10 @@ impl Orchestrator {
 
             let qa_worker = GenericWorker::new(
                 AgentRole::QA,
-                self.model.clone(),
+                model.clone(),
                 self.get_system_prompt(&AgentRole::QA),
                 self.design_doc.clone(),
-                if self.max_steps == 0 { 1000 } else { self.max_steps }
+                if max_steps == 0 { 1000 } else { max_steps }
             );
 
             // Execute review
@@ -221,7 +225,7 @@ impl Orchestrator {
                 "PASSED".to_string()
             } else {
                 let client = openai::Client::new(&openai_key)?;
-                let agent = client.agent(&self.model)
+                let agent = client.agent(&model)
                     .preamble(&qa_worker.system_prompt)
                     .build();
                 let response: String = agent.prompt(&prompt).await?;

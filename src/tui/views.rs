@@ -52,7 +52,7 @@ fn draw_config_modal(frame: &mut Frame, app: &mut App, ctx: &ProjectContext) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
     
-    let area = centered_rect(60, 20, frame.area());
+    let area = centered_rect(60, 35, frame.area());
     frame.render_widget(Clear, area); // This clears the background
     
     let brave_status = if ctx.brave_mode {
@@ -69,6 +69,22 @@ fn draw_config_modal(frame: &mut Frame, app: &mut App, ctx: &ProjectContext) {
                 Style::default()
             })
         ])),
+        ListItem::new(Line::from(vec![
+            Span::styled(format!("Model:     < {} >", ctx.model), if app.modal_selection == 1 {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            })
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled(format!("Max Steps: < {} >", if ctx.max_steps == 0 { "Unlimited".to_string() } else { ctx.max_steps.to_string() }), if app.modal_selection == 2 {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            })
+        ])),
+        ListItem::new(Line::from("")),
+        ListItem::new(Line::from(Span::styled("Use ← → or Enter to adjust values", Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)))),
     ];
 
     let list = List::new(items)

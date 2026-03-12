@@ -46,15 +46,45 @@ impl App {
                         self.modal_selection = self.modal_selection.saturating_sub(1);
                     }
                     KeyCode::Down => {
-                        let max_selection = 0; // Only Brave Mode for now
+                        let max_selection = 2; // Brave, Model, Max Steps
                         if self.modal_selection < max_selection {
                             self.modal_selection += 1;
                         }
                     }
-                    KeyCode::Enter | KeyCode::Char(' ') => {
-                        if self.modal_selection == 0 {
-                            let mut ctx = self.context.lock().await;
-                            ctx.brave_mode = !ctx.brave_mode;
+                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => {
+                        let mut ctx = self.context.lock().await;
+                        match self.modal_selection {
+                            0 => ctx.brave_mode = !ctx.brave_mode,
+                            1 => {
+                                // Cycle models
+                                let current_model = ctx.model.clone();
+                                let models = vec!["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo", "claude-3-5-sonnet-20240620"];
+                                if let Some(idx) = models.iter().position(|&m| m == current_model) {
+                                    ctx.model = models[(idx + 1) % models.len()].to_string();
+                                } else {
+                                    ctx.model = "gpt-4o".to_string();
+                                }
+                            },
+                            2 => ctx.max_steps += 5,
+                            _ => {}
+                        }
+                    }
+                    KeyCode::Left => {
+                        let mut ctx = self.context.lock().await;
+                        match self.modal_selection {
+                            0 => ctx.brave_mode = !ctx.brave_mode,
+                            1 => {
+                                // Cycle models reverse
+                                let current_model = ctx.model.clone();
+                                let models = vec!["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo", "claude-3-5-sonnet-20240620"];
+                                if let Some(idx) = models.iter().position(|&m| m == current_model) {
+                                    ctx.model = models[(idx + models.len() - 1) % models.len()].to_string();
+                                } else {
+                                    ctx.model = "gpt-4o".to_string();
+                                }
+                            },
+                            2 => ctx.max_steps = ctx.max_steps.saturating_sub(5),
+                            _ => {}
                         }
                     }
                     _ => {}

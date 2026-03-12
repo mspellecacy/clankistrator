@@ -20,17 +20,17 @@ use tokio_stream::StreamExt;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(short, long)]
+    #[arg(short, long, default_value = "design.md")]
     design: PathBuf,
 
-    #[arg(short, long)]
+    #[arg(short, long, default_value = "output")]
     output: PathBuf,
 
     #[arg(short, long, default_value = "gpt-4o")]
     model: String,
 
-    #[arg(short, long, default_value_t = false)]
-    tui: bool,
+    #[arg(long, default_value_t = false)]
+    headless: bool,
 
     #[arg(short, long, default_value_t = false)]
     brave: bool,
@@ -45,11 +45,12 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let args = Args::parse();
+    let use_tui = !args.headless;
     
     let env_filter = tracing_subscriber::EnvFilter::from_default_env()
         .add_directive(tracing_subscriber::filter::LevelFilter::INFO.into());
 
-    if args.tui {
+    if use_tui {
         let _ = tui_logger::init_logger(log::LevelFilter::Info);
         let _ = tracing_subscriber::registry()
             .with(tui_logger::TuiTracingSubscriberLayer)
@@ -78,10 +79,10 @@ async fn main() -> Result<()> {
         .unwrap_or("New Project")
         .to_string();
 
-    let context = Arc::new(Mutex::new(ProjectContext::new(project_name, args.output.clone(), args.max_steps, args.brave)));
-    let orchestrator = Orchestrator::new(args.model, design_content.clone(), args.tui, args.max_steps);
+    let context = Arc::new(Mutex::new(ProjectContext::new(project_name, args.output.clone(), args.max_steps, args.brave, args.model.clone())));
+    let orchestrator = Orchestrator::new(args.model, design_content.clone(), use_tui, args.max_steps);
 
-    if args.tui {
+    if use_tui {
         run_tui(context, orchestrator, design_content, args.max_steps).await?;
     } else {
         run_cli(context, orchestrator, design_content, args.max_steps).await?;
