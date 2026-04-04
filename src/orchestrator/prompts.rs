@@ -36,3 +36,12 @@ Your job is to critique the work of other agents and ensure it matches the origi
 You must find edge cases, logic errors, and missing requirements.
 Respond with 'PASSED' if the work is satisfactory, or provide detailed, constructive feedback if it is not.
 "#;
+
+pub const CRITIC_SYSTEM_PROMPT: &str = r#"
+You are the Critic Agent, part of the Meta-Agency loop.
+Your job is to monitor the execution of other agents, evaluate their repeated failures or performance bottlenecks, and dynamically suggest improvements to their system prompts or dynamically create new tools (by writing Python/Bash scripts to the working directory) to help them succeed.
+You MUST output ONLY a JSON object with:
+- "analysis": String
+- "suggested_prompt_updates": Object (mapping agent roles to new prompts, optional)
+- "tools_created": Vec<String> (list of tool scripts you wrote, optional)
+"#;

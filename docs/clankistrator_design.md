@@ -142,6 +142,13 @@ Agents interact with the world via `Tools`. Clankistrator uses the `Rig` library
 - [x] **Defaulted CLI Options**: Make `design` and `output` arguments optional, defaulting to `design.md` and `./output` respectively.
 - [x] **TUI Settings Menu**: Enhance the TUI to allow real-time adjustment of orchestration parameters (e.g., model, max steps, brave mode) through an interactive menu.
 
+### Phase 7: Performance & Parallelism (The Nitro)
+- [x] **Parallel Task Execution**: Use `tokio::task::JoinSet` to execute all "Ready" tasks concurrently.
+- [x] **Parallel Review Phase**: Process multiple tasks waiting for review simultaneously using QA agents.
+- [x] **Brave Mode Optimization**: Batch approve all eligible tasks in a single lock acquisition when Brave Mode is enabled.
+- [x] **Rate Limiting**: Implement a `tokio::sync::Semaphore` to prevent 429 errors from LLM providers.
+- [x] **Improved Logging**: Ensure logs are tagged with `task_id` to avoid confusion during parallel execution.
+
 ## 7. Project Structure (Final Target)
 ```text
 clankistrator/
@@ -232,3 +239,11 @@ Phase 6 has migrated Clankistrator to a TUI-first architecture, making the termi
 - **Defaulted CLI Arguments**: `design` and `output` parameters are now optional, defaulting to `design.md` and `output/` respectively, allowing for a zero-arg startup in many cases.
 - **Dynamic Configuration**: Added the ability to adjust `Brave Mode`, `Model`, and `Max Steps` at runtime via an interactive configuration modal in the TUI (accessible via 'm').
 - **Shared State Orchestration**: The `Orchestrator` now dynamically reads configuration values (model, max_steps) from the shared `ProjectContext` during each execution iteration, ensuring TUI adjustments take effect immediately.
+
+## 15. Phase 7 Implementation Summary (Planned Improvements)
+Phase 7 will focus on the "Nitro" stage, introducing parallelism and performance optimizations to make the orchestrator as fast as direct agent interactions while maintaining structured oversight.
+
+- **Parallelism with JoinSet**: The `run_iteration` function in `src/orchestrator/mod.rs` will be refactored to use `tokio::task::JoinSet` for both the Execution and Review phases.
+- **Concurrency Control**: A `tokio::sync::Semaphore` will be integrated to manage the maximum number of concurrent LLM requests, preventing rate-limiting issues.
+- **Optimized Brave Mode**: Multiple tasks waiting for human approval will be batch-approved in a single lock cycle when the orchestrator is in autonomous mode.
+- **Enhanced Trace Context**: Logging will be improved to include `task_id` in every relevant log message, ensuring clarity even when multiple agents are outputting logs simultaneously.

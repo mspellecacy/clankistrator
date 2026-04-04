@@ -26,6 +26,8 @@ pub enum AgentRole {
     Frontend,
     #[serde(alias = "qa", alias = "QA")]
     QA,
+    #[serde(alias = "critic", alias = "CRITIC")]
+    Critic,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -37,6 +39,16 @@ pub struct ProjectTask {
     pub status: TaskStatus,
     pub assigned_role: AgentRole,
     pub feedback: Option<String>,
+    #[serde(default)]
+    pub retries: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct NewTaskDef {
+    pub title: String,
+    pub description: String,
+    pub assigned_role: AgentRole,
+    pub dependencies: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -46,6 +58,8 @@ pub struct TaskResult {
     pub summary: String,
     pub files_created: Vec<String>,
     pub feedback: Option<String>,
+    #[serde(default)]
+    pub new_tasks: Option<Vec<NewTaskDef>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -132,6 +146,7 @@ mod tests {
             status: TaskStatus::Pending,
             assigned_role: AgentRole::Backend,
             feedback: None,
+            retries: 0,
         });
         context.tasks.push(ProjectTask {
             id: "TASK-2".into(),
@@ -141,6 +156,7 @@ mod tests {
             status: TaskStatus::Pending,
             assigned_role: AgentRole::Frontend,
             feedback: None,
+            retries: 0,
         });
 
         let ready = context.get_ready_tasks();

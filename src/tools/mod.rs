@@ -17,3 +17,6 @@ pub use command_executor::ExecuteCommand;
 
 pub mod rag;
 pub use rag::QueryDesignDoc;
+
+pub mod memory;
+pub use memory::SearchProjectMemory;

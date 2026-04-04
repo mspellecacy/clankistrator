@@ -4,6 +4,7 @@ pub mod orchestrator;
 pub mod tools;
 pub mod parser;
 pub mod tui;
+pub mod mcp;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,6 +38,9 @@ struct Args {
 
     #[arg(short = 'S', long, default_value_t = 50, help = "Maximum orchestration steps (0 for unlimited)")]
     max_steps: usize,
+
+    #[arg(long, help = "Run Clankistrator as an MCP server on stdio")]
+    mcp_server: bool,
 }
 
 #[tokio::main]
@@ -46,6 +50,11 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let use_tui = !args.headless;
+
+    if args.mcp_server {
+        let server = crate::mcp::McpServer::new();
+        return server.run().await;
+    }
     
     let env_filter = tracing_subscriber::EnvFilter::from_default_env()
         .add_directive(tracing_subscriber::filter::LevelFilter::INFO.into());
@@ -122,8 +131,14 @@ async fn run_cli(context: Arc<Mutex<ProjectContext>>, orchestrator: Orchestrator
         
         let ctx = context.lock().await;
         let completed_count = ctx.tasks.iter().filter(|t| matches!(t.status, TaskStatus::Completed { .. })).count();
-        if completed_count == ctx.tasks.len() && !ctx.tasks.is_empty() {
-            tracing::info!("Clankistrator: All tasks completed!");
+        let failed_count = ctx.tasks.iter().filter(|t| matches!(t.status, TaskStatus::Failed { .. })).count();
+        
+        if completed_count + failed_count == ctx.tasks.len() && !ctx.tasks.is_empty() {
+            if failed_count > 0 {
+                tracing::warn!("Clankistrator: Finished with {} completed and {} failed tasks.", completed_count, failed_count);
+            } else {
+                tracing::info!("Clankistrator: All tasks completed!");
+            }
             break;
         }
         i += 1;
@@ -177,11 +192,17 @@ async fn run_tui(context: Arc<Mutex<ProjectContext>>, orchestrator: Orchestrator
     let ctx_clone = Arc::clone(&context);
     tokio::spawn(async move {
         // Bootstrap
-        if let Ok(tasks) = orchestrator.bootstrap_project(&design_content).await {
-            let mut ctx = ctx_clone.lock().await;
-            ctx.tasks = tasks;
-            ctx.token_usage += 1000;
-            ctx.total_cost += 0.02;
+        match orchestrator.bootstrap_project(&design_content).await {
+            Ok(tasks) => {
+                let mut ctx = ctx_clone.lock().await;
+                ctx.tasks = tasks;
+                ctx.token_usage += 1000;
+                ctx.total_cost += 0.02;
+            }
+            Err(e) => {
+                tracing::error!("Orchestrator bootstrap failed: {}", e);
+                return;
+            }
         }
 
         // Execution loop
@@ -192,11 +213,18 @@ async fn run_tui(context: Arc<Mutex<ProjectContext>>, orchestrator: Orchestrator
                 break;
             }
 
-            // Check if all completed
+            // Check if all completed or failed
             {
                 let ctx = ctx_clone.lock().await;
-                if !ctx.tasks.is_empty() && ctx.tasks.iter().all(|t| matches!(t.status, TaskStatus::Completed { .. })) {
-                    tracing::info!("Orchestrator: All tasks completed. Execution loop ending.");
+                let completed = ctx.tasks.iter().filter(|t| matches!(t.status, TaskStatus::Completed { .. })).count();
+                let failed = ctx.tasks.iter().filter(|t| matches!(t.status, TaskStatus::Failed { .. })).count();
+                
+                if !ctx.tasks.is_empty() && completed + failed == ctx.tasks.len() {
+                    if failed > 0 {
+                        tracing::warn!("Orchestrator: Finished with {} completed and {} failed tasks.", completed, failed);
+                    } else {
+                        tracing::info!("Orchestrator: All tasks completed. Execution loop ending.");
+                    }
                     break;
                 }
             }

@@ -4,3 +4,4 @@
 .env*
 !.env.example
 /test_app/
+/.junie/
