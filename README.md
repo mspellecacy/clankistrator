@@ -103,4 +103,4 @@ clankistrator/
 ```
 
 ## ⚖️ License
-This project is currently private.
+MIT. See `LICENSE`.
