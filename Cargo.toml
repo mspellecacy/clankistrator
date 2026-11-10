@@ -22,6 +22,7 @@ ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 tui-logger = { version = "0.18.1", features = ["tracing-support"] }
 tokio-stream = "0.1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

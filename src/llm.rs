@@ -3,7 +3,6 @@
 //! Everything else goes through the [`Llm`] trait, which keeps the orchestration
 //! logic testable with scripted replies.
 
-use std::fmt::Display;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -96,10 +95,6 @@ pub fn uses_free_tier(model_specs: &[&str]) -> bool {
 /// spends time and allowance.
 pub fn is_transient(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
-    // A daily allowance does not come back by waiting a minute.
-    if lower.contains("per-day") || lower.contains("per day") {
-        return false;
-    }
     let status = lower
         .split_once("status code ")
         .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
@@ -123,13 +118,57 @@ pub fn is_transient(error: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
+/// What OpenRouter reports about the account's free-model requests for the current UTC day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreeAllowance {
+    pub limit: u64,
+    pub remaining: u64,
+}
+
+/// The error text for a used-up daily allowance. Not transient, and permanent for an agent.
+pub const FREE_ALLOWANCE_USED_UP: &str = "OpenRouter's free-model allowance for today is used up. It is counted \
+     per UTC day; continue with --resume after it resets, or use a model that is not on the free tier.";
+
+fn parse_free_allowance(body: &serde_json::Value) -> Option<FreeAllowance> {
+    let counter = body.get("data")?.get("free_model_daily_requests")?;
+    Some(FreeAllowance { limit: counter.get("limit")?.as_u64()?, remaining: counter.get("remaining")?.as_u64()? })
+}
+
+/// Ask OpenRouter how much of the day's free-model allowance is left. `None`
+/// if there is no key or the question could not be answered; the counter can
+/// also lag a little behind requests just made.
+pub async fn free_allowance() -> Option<FreeAllowance> {
+    let key = api_key(Provider::OpenRouter).ok()?;
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(15)).build().ok()?;
+    let response = client.get("https://openrouter.ai/api/v1/key").bearer_auth(key).send().await.ok()?;
+    parse_free_allowance(&response.json::<serde_json::Value>().await.ok()?)
+}
+
+/// OpenRouter answers a used-up day and a busy minute with the same 429, and
+/// only its own counter tells them apart.
+async fn free_allowance_used_up() -> bool {
+    matches!(free_allowance().await, Some(FreeAllowance { remaining: 0, .. }))
+}
+
+/// Why a request that failed for a passing reason should not be sent again after all.
+enum GiveUp {
+    No,
+    Because(&'static str),
+}
+
 /// Make one request, waiting for the pacer first and trying again after a
-/// passing failure.
-async fn send_with_retries<T, E, F, Fut>(pacer: Option<&Pacer>, delays: &[Duration], mut send: F) -> Result<T, E>
+/// passing failure. `give_up` is asked before each wait.
+async fn send_with_retries<T, F, Fut, G, GFut>(
+    pacer: Option<&Pacer>,
+    delays: &[Duration],
+    mut send: F,
+    give_up: G,
+) -> Result<T, CompletionError>
 where
-    E: Display,
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
+    Fut: Future<Output = Result<T, CompletionError>>,
+    G: Fn() -> GFut,
+    GFut: Future<Output = GiveUp>,
 {
     let mut delays = delays.iter();
     loop {
@@ -137,13 +176,14 @@ where
             pacer.wait().await;
         }
         match send().await {
-            Err(e) if is_transient(&e.to_string()) => match delays.next() {
-                Some(delay) => {
-                    tracing::warn!("Model request failed, sending it again in {}s: {e}", delay.as_secs());
-                    tokio::time::sleep(*delay).await;
+            Err(e) if is_transient(&e.to_string()) => {
+                let Some(delay) = delays.next() else { return Err(e) };
+                if let GiveUp::Because(reason) = give_up().await {
+                    return Err(CompletionError::ProviderError(reason.to_string()));
                 }
-                None => return Err(e),
-            },
+                tracing::warn!("Model request failed, sending it again in {}s: {e}", delay.as_secs());
+                tokio::time::sleep(*delay).await;
+            }
             other => return other,
         }
     }
@@ -181,7 +221,20 @@ impl<M: CompletionModel> CompletionModel for Steady<M> {
         &self,
         request: CompletionRequest,
     ) -> impl Future<Output = Result<CompletionResponse<Self::Response>, CompletionError>> + Send {
-        send_with_retries(self.pacer, &REQUEST_RETRY_DELAYS, move || self.inner.completion(request.clone()))
+        // Only the free tier is paced, and only it has a daily allowance to run out of.
+        let on_free_tier = self.pacer.is_some();
+        send_with_retries(
+            self.pacer,
+            &REQUEST_RETRY_DELAYS,
+            move || self.inner.completion(request.clone()),
+            move || async move {
+                if on_free_tier && free_allowance_used_up().await {
+                    GiveUp::Because(FREE_ALLOWANCE_USED_UP)
+                } else {
+                    GiveUp::No
+                }
+            },
+        )
     }
 
     fn stream(
@@ -477,6 +530,8 @@ macro_rules! run_agent {
 impl RigLlm {
     async fn dispatch(&self, request: &AgentRequest) -> Result<LlmReply, LlmError> {
         let (provider, model) = resolve_model(&request.model);
+        // Checked here as well as at startup: the TUI and the MCP server can name a model later.
+        check_credentials(&request.model).map_err(LlmError::Other)?;
         let key = api_key(provider).map_err(LlmError::Other)?;
         let client_error = |e| LlmError::Other(anyhow!("could not create the {provider:?} client: {e}"));
         let no_limit: Option<u64> = None;
@@ -649,10 +704,10 @@ mod tests {
         ));
         assert!(is_transient("HttpError: Invalid status code 503 Service Unavailable"));
         assert!(is_transient("HttpError: Invalid status code 529 with message: overloaded_error"));
-        assert!(is_transient("ProviderError: Rate limit exceeded: free-models-per-min"));
+        assert!(is_transient("ProviderError: Rate limit exceeded"));
         assert!(is_transient("HttpError: error sending request for url"));
-        // The day's allowance is used up: waiting a minute changes nothing.
-        assert!(!is_transient("HttpError: Invalid status code 429 with message: Rate limit exceeded: free-models-per-day"));
+        // What this program says once OpenRouter's counter shows the day is used up.
+        assert!(!is_transient(&CompletionError::ProviderError(FREE_ALLOWANCE_USED_UP.to_string()).to_string()));
         // The request itself is wrong.
         assert!(!is_transient("HttpError: Invalid status code 404 Not Found with message: model not found"));
         assert!(!is_transient("HttpError: Invalid status code 401 Unauthorized"));
@@ -662,38 +717,77 @@ mod tests {
         assert!(!is_transient("JsonError: missing field `choices`"));
     }
 
+    fn failure(text: &str) -> CompletionError {
+        CompletionError::ProviderError(text.to_string())
+    }
+
+    async fn carry_on() -> GiveUp {
+        GiveUp::No
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_request_turned_away_for_a_passing_reason_is_sent_again() {
         let delays = [Duration::from_secs(5), Duration::from_secs(20)];
         let started = Instant::now();
 
         let mut sent = 0;
-        let reply: Result<&str, String> = send_with_retries(None, &delays, || {
-            sent += 1;
-            let outcome = if sent < 3 { Err("status code 429 Too Many Requests".to_string()) } else { Ok("done") };
-            async move { outcome }
-        })
+        let reply = send_with_retries(
+            None,
+            &delays,
+            || {
+                sent += 1;
+                let outcome = if sent < 3 { Err(failure("status code 429 Too Many Requests")) } else { Ok("done") };
+                async move { outcome }
+            },
+            carry_on,
+        )
         .await;
-        assert_eq!((reply, sent), (Ok("done"), 3));
+        assert_eq!((reply.unwrap(), sent), ("done", 3));
         assert_eq!(started.elapsed(), Duration::from_secs(25));
 
         // It gives up when the waits are used up...
         let mut sent = 0;
-        let reply: Result<(), String> = send_with_retries(None, &delays, || {
-            sent += 1;
-            async { Err("status code 503".to_string()) }
-        })
+        let reply: Result<(), _> = send_with_retries(
+            None,
+            &delays,
+            || {
+                sent += 1;
+                async { Err(failure("status code 503")) }
+            },
+            carry_on,
+        )
         .await;
         assert_eq!((reply.is_err(), sent), (true, 3));
 
-        // ...and at once when sending again cannot help.
+        // ...at once when sending again cannot help...
         let mut sent = 0;
-        let reply: Result<(), String> = send_with_retries(None, &delays, || {
-            sent += 1;
-            async { Err("status code 404 model not found".to_string()) }
-        })
+        let reply: Result<(), _> = send_with_retries(
+            None,
+            &delays,
+            || {
+                sent += 1;
+                async { Err(failure("status code 404 model not found")) }
+            },
+            carry_on,
+        )
         .await;
         assert_eq!((reply.is_err(), sent), (true, 1));
+
+        // ...and without waiting when the day's allowance turns out to be gone.
+        let started = Instant::now();
+        let mut sent = 0;
+        let reply: Result<(), _> = send_with_retries(
+            None,
+            &delays,
+            || {
+                sent += 1;
+                async { Err(failure("status code 429 Rate limit exceeded")) }
+            },
+            || async { GiveUp::Because(FREE_ALLOWANCE_USED_UP) },
+        )
+        .await;
+        assert!(reply.unwrap_err().to_string().contains("allowance for today is used up"));
+        assert_eq!((sent, started.elapsed()), (1, Duration::ZERO));
     }
 
     #[tokio::test(start_paused = true)]
@@ -711,11 +805,24 @@ mod tests {
         pacer.wait().await;
         assert_eq!(resumed.elapsed(), Duration::ZERO);
         // ...and a retry is paced like any other request.
-        let reply: Result<(), String> =
-            send_with_retries(Some(&pacer), &[Duration::from_secs(1)], || async { Err("status code 429".to_string()) })
-                .await;
+        let reply: Result<(), _> = send_with_retries(
+            Some(&pacer),
+            &[Duration::from_secs(1)],
+            || async { Err(failure("status code 429")) },
+            carry_on,
+        )
+        .await;
         assert!(reply.is_err());
         assert_eq!(pacer.sent.load(Ordering::Relaxed), 6);
+    }
+
+    #[test]
+    fn the_daily_counter_is_read_from_openrouters_answer() {
+        // The shape OpenRouter returned for this account on 2026-11-10.
+        let body = serde_json::json!({"data": {"is_free_tier": true,
+            "free_model_daily_requests": {"used": 9, "limit": 50, "remaining": 41}}});
+        assert_eq!(parse_free_allowance(&body), Some(FreeAllowance { limit: 50, remaining: 41 }));
+        assert_eq!(parse_free_allowance(&serde_json::json!({"error": {"code": 401}})), None);
     }
 
     #[test]

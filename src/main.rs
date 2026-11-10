@@ -273,10 +273,18 @@ async fn run() -> Result<ExitCode> {
     // instead of after a worker has spent tokens on something nobody can review.
     let mut context = context;
     if llm::uses_free_tier(&[context.model.as_str(), context.reviewer_model()]) {
+        let left = match llm::free_allowance().await {
+            Some(llm::FreeAllowance { remaining: 0, .. }) => bail!("{}", llm::FREE_ALLOWANCE_USED_UP),
+            Some(allowance) => format!(
+                "OpenRouter reports {} of today's {} free-model requests left",
+                allowance.remaining, allowance.limit
+            ),
+            None => "OpenRouter did not say how many free-model requests are left today".to_string(),
+        };
         tracing::warn!(
-            "Clankistrator: using an OpenRouter free model. Requests to it are spaced out to stay under 20 a \
-             minute, and the free tier allows 50 a day (1,000 once the account has bought 10 credits). When the \
-             day's allowance runs out the run stops with failed tasks; continue it later with --resume."
+            "Clankistrator: using an OpenRouter free model. {left}. Every turn of an agent is one request; \
+             requests are spaced out to stay under 20 a minute. If the day's allowance runs out, the remaining \
+             tasks fail and the run can be continued later with --resume."
         );
     }
     let used = probe::preflight(&llm, &[context.model.as_str(), context.reviewer_model()]).await?;
@@ -322,7 +330,7 @@ async fn run_cli(context: SharedContext, orchestrator: Orchestrator) -> Result<E
         println!("{}: {} - {}", task.id, task.title, status);
     }
     println!("Model calls: {}, tokens: {}, steps: {}", ctx.llm_calls, ctx.token_summary(), ctx.steps_taken);
-    print_free_tier_use();
+    print_free_tier_use().await;
     if let Some(findings) = &ctx.design_check {
         print_design_report(findings, false);
         if ctx.tasks.len() > ctx.design_checked_task_count {
@@ -376,13 +384,18 @@ async fn run_cli(context: SharedContext, orchestrator: Orchestrator) -> Result<E
 
 /// Print the result of a design check. `list_met` also lists what was found met.
 /// The free tier counts requests, not tokens, so say how many this run used.
-fn print_free_tier_use() {
+async fn print_free_tier_use() {
     let requests = llm::free_model_requests();
-    if requests > 0 {
-        println!(
-            "OpenRouter free-model requests: {requests} (the free tier allows 50 a day, \
-             or 1,000 once the account has bought 10 credits)"
-        );
+    if requests == 0 {
+        return;
+    }
+    match llm::free_allowance().await {
+        Some(allowance) => println!(
+            "OpenRouter free-model requests: {requests} sent; OpenRouter reports {} of today's {} left \
+             (its counter can lag by a few minutes)",
+            allowance.remaining, allowance.limit
+        ),
+        None => println!("OpenRouter free-model requests: {requests} sent"),
     }
 }
 
@@ -438,7 +451,7 @@ async fn run_probe(args: &Args) -> Result<ExitCode> {
             println!("  note: the provider reported no token usage, so run summaries will show 0 for this model");
         }
     }
-    print_free_tier_use();
+    print_free_tier_use().await;
     println!(
         "\n{}",
         if all_passed {
@@ -485,7 +498,7 @@ async fn run_check(args: &Args, design_content: String) -> Result<ExitCode> {
         check.calls,
         format_tokens(check.usage.input_tokens, check.usage.cached_input_tokens, check.usage.output_tokens)
     );
-    print_free_tier_use();
+    print_free_tier_use().await;
     let unmet = check.findings.iter().filter(|f| f.status == FindingStatus::Unmet).count();
     if unmet == 0 {
         println!("Nothing was found unmet.");

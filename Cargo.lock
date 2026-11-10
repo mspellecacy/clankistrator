@@ -275,6 +275,7 @@ dependencies = [
  "log",
  "pulldown-cmark",
  "ratatui",
+ "reqwest",
  "rig-core",
  "serde",
  "serde_json",

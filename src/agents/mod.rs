@@ -54,10 +54,12 @@ fn is_permanent(error: &str) -> bool {
         "authentication",
         "permission",
         "is not set",
-        // Out of credit, or out of the day's free allowance: waiting seconds does not help.
+        // Out of credit, out of the day's free allowance, or a model the
+        // settings forbid: waiting seconds does not help.
         "status code 402",
         "payment required",
-        "per-day",
+        "allowance for today is used up",
+        "is not a free openrouter model",
     ]
         .iter()
         .any(|marker| lower.contains(marker))
@@ -198,19 +200,24 @@ pub fn extract_json(text: &str, open: char, close: char) -> Option<Value> {
         return Some(value);
     }
     // Several values with prose between them: a model that corrects itself
-    // writes its answer twice, and the last one is the one it stands by.
+    // writes its answer twice, and the last one is the one it stands by. Only
+    // values that start their own line count, and every one of them has to
+    // parse: looking inside or past a value that did not would turn a
+    // truncated answer into one of its fragments (a task's dependency list,
+    // an entry of `new_tasks`, the `{}` in a line of code).
     let mut last = None;
-    let mut from = start;
-    while let Some(offset) = text[from..].find(open) {
-        let at = from + offset;
-        let mut values = serde_json::Deserializer::from_str(&text[at..]).into_iter::<Value>();
-        match values.next() {
-            Some(Ok(value)) => {
-                last = Some(value);
-                from = at + values.byte_offset().max(1);
-            }
-            _ => from = at + open.len_utf8(),
+    let mut line_start = 0;
+    let mut skip_until = 0;
+    for line in text.split_inclusive('\n') {
+        let at = line_start;
+        line_start += line.len();
+        if at < skip_until || !line.starts_with(open) {
+            continue;
         }
+        let mut values = serde_json::Deserializer::from_str(&text[at..]).into_iter::<Value>();
+        let Some(Ok(value)) = values.next() else { return None };
+        last = Some(value);
+        skip_until = at + values.byte_offset();
     }
     last
 }
@@ -760,7 +767,20 @@ mod tests {
             extract_json("[{\"id\":1,\"status\":\"met\"}]\n\nWait, the correct answer is:\n\n[{\"id\":1,\"status\":\"unmet\"}]", '[', ']'),
             Some(json!([{"id":1,"status":"unmet"}]))
         );
-        assert_eq!(extract_json("first {\"a\": [1]} then {\"a\": [2]} done", '{', '}'), Some(json!({"a":[2]})));
+        assert_eq!(
+            extract_json("{\n  \"a\": [1]\n}\nNo, rather:\n{\n  \"a\": [2]\n}\nThat is all.", '{', '}'),
+            Some(json!({"a":[2]}))
+        );
+        // A fragment of a broken answer is not an answer.
+        assert_eq!(extract_json("I ran it:\nfn main() { println!(\"{}\", x) }\nand it works", '{', '}'), None);
+        assert_eq!(
+            extract_json("[\n  {\"id\": \"T1\", \"dependencies\": []},\n  {\"id\": \"T2\", \"dependencies\": [\"T1\"]},\n  {\"id\":", '[', ']'),
+            None
+        );
+        assert_eq!(
+            extract_json("{\"status\": \"completed\", \"new_tasks\": [\n{\"title\": \"x\", \"dependencies\": []}\n], \"summary\": \"cut off", '{', '}'),
+            None
+        );
         assert_eq!(extract_json("", '{', '}'), None);
         assert_eq!(extract_json("no json here", '{', '}'), None);
         assert_eq!(extract_json("} backwards {", '{', '}'), None);
@@ -983,7 +1003,8 @@ mod tests {
         assert!(is_permanent("CompletionError: HTTP 401 Unauthorized"));
         assert!(is_permanent("Incorrect API key provided (invalid_api_key)"));
         assert!(is_permanent("OPENAI_API_KEY is not set"));
-        assert!(is_permanent("Invalid status code 429 with message: Rate limit exceeded: free-models-per-day"));
+        assert!(is_permanent(crate::llm::FREE_ALLOWANCE_USED_UP));
+        assert!(!crate::llm::is_transient(crate::llm::FREE_ALLOWANCE_USED_UP));
         assert!(is_permanent("Invalid status code 402 Payment Required"));
         assert!(!is_permanent("HTTP 429 Too Many Requests: rate limit reached"));
         assert!(!is_permanent("503 service unavailable"));
