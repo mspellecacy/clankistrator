@@ -121,8 +121,7 @@ pub async fn plan_tasks(
             .await
             .map_err(|e| anyhow!("planning failed: {e}"))?;
         calls += 1;
-        usage.input_tokens += reply.usage.input_tokens;
-        usage.output_tokens += reply.usage.output_tokens;
+        usage += reply.usage;
 
         match parse_plan(&reply.text) {
             Ok(tasks) => {
@@ -217,10 +216,7 @@ pub async fn check_design(
 ) -> Result<DesignCheck> {
     let mut usage = TokenUsage::default();
     let mut calls = 0;
-    let mut add = |more: TokenUsage| {
-        usage.input_tokens += more.input_tokens;
-        usage.output_tokens += more.output_tokens;
-    };
+    let mut add = |more: TokenUsage| usage += more;
 
     let requirements = if known_requirements.is_empty() {
         let (requirements, used) = agents::extract_requirements(llm, settings)
@@ -254,6 +250,7 @@ pub async fn check_design(
 
 fn record_usage(ctx: &mut ProjectContext, usage: TokenUsage, calls: u64) {
     ctx.input_tokens += usage.input_tokens;
+    ctx.cached_input_tokens += usage.cached_input_tokens;
     ctx.output_tokens += usage.output_tokens;
     ctx.llm_calls += calls;
 }
@@ -805,7 +802,7 @@ mod tests {
                 };
                 (self.script)(this, &request, earlier).map(|text| LlmReply {
                     text,
-                    usage: TokenUsage { input_tokens: 10, output_tokens: 5 },
+                    usage: TokenUsage { input_tokens: 10, cached_input_tokens: 4, output_tokens: 5 },
                 })
             })
         }
@@ -907,7 +904,8 @@ mod tests {
         assert!(ctx.succeeded());
         // 1 plan + 2 workers + 2 reviews + 1 requirement list + 1 design check, 10 in / 5 out each.
         assert_eq!(ctx.llm_calls, 7);
-        assert_eq!((ctx.input_tokens, ctx.output_tokens), (70, 35));
+        assert_eq!((ctx.input_tokens, ctx.cached_input_tokens, ctx.output_tokens), (70, 28, 35));
+        assert_eq!(ctx.token_summary(), "70 in (28 from cache) / 35 out");
         assert_eq!(ctx.get_task("TASK-1").unwrap().files, vec!["out.txt"]);
 
         let workers = llm.requests(Kind::Worker);

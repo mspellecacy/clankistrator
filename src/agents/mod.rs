@@ -517,8 +517,7 @@ async fn verify_items(
                 Err(e) => break Err(e),
             };
             run.calls += 1;
-            run.usage.input_tokens += reply.usage.input_tokens;
-            run.usage.output_tokens += reply.usage.output_tokens;
+            run.usage += reply.usage;
             tracing::debug!("Reviewer reply (batch {}, attempt {attempt}): {}", number + 1, reply.text);
             replies.push(reply.text.clone());
 

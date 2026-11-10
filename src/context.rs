@@ -191,6 +191,9 @@ pub struct ProjectContext {
     /// Token counts as reported by the provider.
     #[serde(default)]
     pub input_tokens: u64,
+    /// The part of `input_tokens` read from the provider's prompt cache.
+    #[serde(default)]
+    pub cached_input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
     #[serde(default)]
@@ -265,6 +268,7 @@ impl ProjectContext {
             tasks: Vec::new(),
             working_directory: output_dir,
             input_tokens: 0,
+            cached_input_tokens: 0,
             output_tokens: 0,
             llm_calls: 0,
             steps_taken: 0,
@@ -292,6 +296,11 @@ impl ProjectContext {
             && self.count_failed() == 0
             && self.design_check_error.is_none()
             && (self.design_check.is_none() || self.tasks.len() > self.design_checked_task_count)
+    }
+
+    /// "1234 in (1000 from cache) / 56 out", for summaries.
+    pub fn token_summary(&self) -> String {
+        format_tokens(self.input_tokens, self.cached_input_tokens, self.output_tokens)
     }
 
     /// The model used for reviews and the design check.
@@ -504,6 +513,14 @@ impl ProjectContext {
         self.fix_rounds_done = 0;
         self.design_check = None;
         self.design_check_error = None;
+    }
+}
+
+pub fn format_tokens(input: u64, cached: u64, output: u64) -> String {
+    if cached > 0 {
+        format!("{input} in ({cached} from cache) / {output} out")
+    } else {
+        format!("{input} in / {output} out")
     }
 }
 

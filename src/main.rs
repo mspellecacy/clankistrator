@@ -20,7 +20,7 @@ use tokio_stream::StreamExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::agents::AgentSettings;
-use crate::context::{DEFAULT_FIX_ROUNDS, Finding, FindingStatus, ProjectContext, TaskStatus};
+use crate::context::{DEFAULT_FIX_ROUNDS, Finding, FindingStatus, ProjectContext, TaskStatus, format_tokens};
 use crate::llm::{RigLlm, check_credentials};
 use crate::orchestrator::{Hitl, Orchestrator, PROVIDER_RETRY_DELAY, RunEnd, SharedContext, check_design};
 use crate::tools::Sandbox;
@@ -82,6 +82,10 @@ struct Args {
     #[arg(long, conflicts_with_all = ["resume", "mcp_server"])]
     check: bool,
 
+    /// Do not ask Anthropic to cache prompts between an agent's turns
+    #[arg(long)]
+    no_prompt_cache: bool,
+
     /// Continue the run saved in the output directory instead of starting over
     #[arg(long)]
     resume: bool,
@@ -142,7 +146,8 @@ async fn run() -> Result<ExitCode> {
     if args.mcp_server {
         // stdout carries the protocol, so logs go to stderr.
         tracing_subscriber::fmt().with_env_filter(env_filter()).with_writer(std::io::stderr).init();
-        let server = mcp::McpServer::new(Arc::new(RigLlm), args.model.unwrap_or_else(default_model));
+        let llm = RigLlm { prompt_caching: !args.no_prompt_cache };
+        let server = mcp::McpServer::new(Arc::new(llm), args.model.unwrap_or_else(default_model));
         server.run().await?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -254,7 +259,8 @@ async fn run() -> Result<ExitCode> {
     }
 
     let context: SharedContext = Arc::new(Mutex::new(context));
-    let orchestrator = Orchestrator::new(Arc::new(RigLlm), design_content, sandbox);
+    let llm = RigLlm { prompt_caching: !args.no_prompt_cache };
+    let orchestrator = Orchestrator::new(Arc::new(llm), design_content, sandbox);
 
     if use_tui {
         run_tui(context, orchestrator).await?;
@@ -290,10 +296,7 @@ async fn run_cli(context: SharedContext, orchestrator: Orchestrator) -> Result<E
         };
         println!("{}: {} - {}", task.id, task.title, status);
     }
-    println!(
-        "Model calls: {}, tokens: {} in / {} out, steps: {}",
-        ctx.llm_calls, ctx.input_tokens, ctx.output_tokens, ctx.steps_taken
-    );
+    println!("Model calls: {}, tokens: {}, steps: {}", ctx.llm_calls, ctx.token_summary(), ctx.steps_taken);
     if let Some(findings) = &ctx.design_check {
         print_design_report(findings, false);
     }
@@ -387,15 +390,17 @@ async fn run_check(args: &Args, design_content: String) -> Result<ExitCode> {
         plan: String::new(),
         retry_delay: PROVIDER_RETRY_DELAY,
     };
+    let llm = RigLlm { prompt_caching: !args.no_prompt_cache };
     let check = tokio::select! {
-        check = check_design(&RigLlm, &[], &settings) => check?,
+        check = check_design(&llm, &[], &settings) => check?,
         _ = tokio::signal::ctrl_c() => return Ok(ExitCode::from(130)),
     };
 
     print_design_report(&check.findings, true);
     println!(
-        "\nModel calls: {}, tokens: {} in / {} out",
-        check.calls, check.usage.input_tokens, check.usage.output_tokens
+        "\nModel calls: {}, tokens: {}",
+        check.calls,
+        format_tokens(check.usage.input_tokens, check.usage.cached_input_tokens, check.usage.output_tokens)
     );
     let unmet = check.findings.iter().filter(|f| f.status == FindingStatus::Unmet).count();
     if unmet == 0 {

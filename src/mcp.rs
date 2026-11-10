@@ -192,7 +192,11 @@ impl McpServer {
         serde_json::to_string_pretty(&json!({
             "model": model,
             "tasks": tasks,
-            "usage": { "input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens }
+            "usage": {
+                "input_tokens": usage.input_tokens,
+                "cached_input_tokens": usage.cached_input_tokens,
+                "output_tokens": usage.output_tokens
+            }
         }))
         .map_err(|e| e.to_string())
     }
@@ -222,6 +226,7 @@ impl McpServer {
             "usage": {
                 "model_calls": ctx.llm_calls,
                 "input_tokens": ctx.input_tokens,
+                "cached_input_tokens": ctx.cached_input_tokens,
                 "output_tokens": ctx.output_tokens
             }
         }))

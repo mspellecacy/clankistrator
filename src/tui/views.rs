@@ -325,7 +325,14 @@ fn draw_stats(frame: &mut Frame, ctx: &ProjectContext, area: Rect) {
         field("Output:        ", ctx.working_directory.display().to_string()),
         Line::from(""),
         field("Model calls:   ", ctx.llm_calls.to_string()),
-        field("Input tokens:  ", ctx.input_tokens.to_string()),
+        field(
+            "Input tokens:  ",
+            if ctx.cached_input_tokens > 0 {
+                format!("{} ({} read from the provider's cache)", ctx.input_tokens, ctx.cached_input_tokens)
+            } else {
+                ctx.input_tokens.to_string()
+            },
+        ),
         field("Output tokens: ", ctx.output_tokens.to_string()),
         Line::from(Span::styled(
             "Token counts are the totals reported by the provider for finished agent runs.",

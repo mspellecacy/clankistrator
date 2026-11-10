@@ -57,6 +57,12 @@ cargo run --release -- --design docs/sumcli_design.md --output ../sumcli --headl
 
 A run makes real, billed model calls: one for planning, then at least one worker run and one review per task, each of which can be many turns.
 
+### What a run costs
+
+An agent sends its whole conversation again on every turn, so input tokens dominate: one run of the calculator example, before caching was added, took about 700,000 input tokens and 43,000 output tokens. Prompt caching is what keeps that affordable. With Anthropic models Clankistrator asks for it (turn it off with `--no-prompt-cache`); OpenAI applies it on its own. Tokens read from the cache are billed at a fraction of the normal input price, and with Anthropic the tokens written to the cache cost somewhat more than normal input, so caching pays off from an agent's second turn on.
+
+The summary reports input tokens as one total, with the part read from the cache in brackets, in the form `12000 in (9000 from cache) / 800 out`. The total includes cached reads and, for Anthropic, cache writes. There is no cost estimate in currency; multiply by your provider's prices.
+
 ## Options
 
 | Flag | Default | Meaning |
@@ -72,6 +78,7 @@ A run makes real, billed model calls: one for planning, then at least one worker
 | `--review-model <MODEL>` | same as `--model` | Model for reviews and the design check. A stronger model here is the cheapest way to a stricter gate |
 | `--fix-rounds <N>` | 2 | How many times unmet design requirements are turned into a fix task |
 | `--skip-design-check` | off | Do not check the finished project against the design |
+| `--no-prompt-cache` | off | Do not ask Anthropic to cache prompts between an agent's turns |
 | `--check` | off | Only check the project in `--output` against `--design` and print the findings. Exits 1 if anything is unmet |
 | `--resume` | off | Continue the run saved in the output directory. Interrupted and failed tasks are queued again |
 | `--mcp-server` | off | Run as an MCP server instead (see below) |
@@ -108,7 +115,7 @@ Settings are read from the environment, `.env.local` and `.env` (in that order o
 | `PgUp` `PgDn` `Esc` (Logs) | Scroll, return to following |
 | `q`, `Ctrl-C` | Quit. Progress is saved; continue with `--resume` |
 
-Stats shows the token counts reported by the provider and the result of the design check. There is no cost estimate.
+Stats shows the token counts reported by the provider, including how many input tokens came from its prompt cache, and the result of the design check.
 
 ## MCP server
 

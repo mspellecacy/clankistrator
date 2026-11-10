@@ -5,9 +5,12 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
+use rig::agent::{AgentBuilder, HookAction, PromptHook};
 use rig::client::{CompletionClient, Nothing};
 use rig::completion::{Prompt, PromptError};
 use rig::providers::{anthropic, gemini, ollama, openai};
@@ -34,8 +37,34 @@ pub struct AgentRequest {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
+    /// All input tokens the provider reported, including those read from its prompt cache.
     pub input_tokens: u64,
+    /// The part of `input_tokens` that was read from the provider's prompt
+    /// cache, which providers bill at a fraction of the normal price.
+    pub cached_input_tokens: u64,
     pub output_tokens: u64,
+}
+
+impl std::ops::AddAssign for TokenUsage {
+    fn add_assign(&mut self, other: Self) {
+        self.input_tokens += other.input_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.output_tokens += other.output_tokens;
+    }
+}
+
+impl TokenUsage {
+    /// Put a provider's numbers on one footing. OpenAI counts cached tokens
+    /// inside its input total. Anthropic reports three separate numbers:
+    /// uncached input, input read from the cache, and input written to the
+    /// cache (`cache_writes`, which rig's own usage figures leave out).
+    fn normalised(provider: Provider, input: u64, cached: u64, cache_writes: u64, output: u64) -> Self {
+        let input_tokens = match provider {
+            Provider::Anthropic => input + cached + cache_writes,
+            Provider::OpenAi | Provider::Gemini | Provider::Ollama => input.max(cached),
+        };
+        Self { input_tokens, cached_input_tokens: cached, output_tokens: output }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -152,15 +181,46 @@ fn ollama_base_url() -> Option<String> {
 }
 
 /// The real implementation, backed by rig.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct RigLlm;
+#[derive(Debug, Clone, Copy)]
+pub struct RigLlm {
+    /// Ask Anthropic to cache the prompt prefix between an agent's turns.
+    /// (OpenAI caches on its own; rig has no switch for the other providers.)
+    pub prompt_caching: bool,
+}
+
+impl Default for RigLlm {
+    fn default() -> Self {
+        Self { prompt_caching: true }
+    }
+}
+
+/// Adds up the tokens Anthropic says were written to its prompt cache. rig
+/// drops this number when it converts a response, so without the hook a
+/// request that fills the cache would look almost free.
+#[derive(Clone, Default)]
+struct CacheWriteCounter(Arc<AtomicU64>);
+
+impl PromptHook<anthropic::completion::CompletionModel> for CacheWriteCounter {
+    fn on_completion_response(
+        &self,
+        _prompt: &rig::completion::Message,
+        response: &rig::completion::CompletionResponse<anthropic::completion::CompletionResponse>,
+    ) -> impl Future<Output = HookAction> + Send {
+        let written = response.raw_response.usage.cache_creation_input_tokens.unwrap_or(0);
+        self.0.fetch_add(written, Ordering::Relaxed);
+        async { HookAction::cont() }
+    }
+}
 
 /// Builds and runs an agent on a concrete rig client. A macro rather than a
 /// generic function because each provider has its own client and model types.
 macro_rules! run_agent {
-    ($client:expr, $model:expr, $request:expr, $max_tokens:expr) => {{
+    ($builder:expr, $request:expr, $max_tokens:expr) => {
+        run_agent!($builder, $request, $max_tokens, ())
+    };
+    ($builder:expr, $request:expr, $max_tokens:expr, $hook:expr) => {{
         let request: &AgentRequest = $request;
-        let mut builder = $client.agent($model).preamble(&request.preamble);
+        let mut builder = $builder.preamble(&request.preamble);
         if let Some(max_tokens) = $max_tokens {
             builder = builder.max_tokens(max_tokens);
         }
@@ -173,6 +233,7 @@ macro_rules! run_agent {
         agent
             .prompt(request.prompt.as_str())
             .max_turns(request.max_turns)
+            .with_hook($hook)
             .extended_details()
             .await
     }};
@@ -184,11 +245,12 @@ impl RigLlm {
         let key = api_key(provider).map_err(LlmError::Other)?;
         let client_error = |e| LlmError::Other(anyhow!("could not create the {provider:?} client: {e}"));
         let no_limit: Option<u64> = None;
+        let cache_writes = CacheWriteCounter::default();
 
         let result = match provider {
             Provider::OpenAi => {
                 let client = openai::Client::new(&key).map_err(client_error)?;
-                run_agent!(client, model, request, no_limit)
+                run_agent!(client.agent(model), request, no_limit)
             }
             Provider::Anthropic => {
                 let client = anthropic::Client::new(&key).map_err(client_error)?;
@@ -201,11 +263,18 @@ impl RigLlm {
                 } else {
                     Some(ANTHROPIC_FALLBACK_MAX_TOKENS)
                 };
-                run_agent!(client, model, request, max_tokens)
+                // An agent re-sends its whole conversation on every turn. With
+                // caching, the part already sent is read back from the cache at a
+                // fraction of the input price instead of being billed in full again.
+                let mut completion_model = client.completion_model(model);
+                if self.prompt_caching {
+                    completion_model = completion_model.with_prompt_caching();
+                }
+                run_agent!(AgentBuilder::new(completion_model), request, max_tokens, cache_writes.clone())
             }
             Provider::Gemini => {
                 let client = gemini::Client::new(&key).map_err(client_error)?;
-                run_agent!(client, model, request, no_limit)
+                run_agent!(client.agent(model), request, no_limit)
             }
             Provider::Ollama => {
                 let mut builder = ollama::Client::builder().api_key(Nothing);
@@ -213,17 +282,20 @@ impl RigLlm {
                     builder = builder.base_url(url);
                 }
                 let client = builder.build().map_err(client_error)?;
-                run_agent!(client, model, request, no_limit)
+                run_agent!(client.agent(model), request, no_limit)
             }
         };
 
         match result {
             Ok(response) => Ok(LlmReply {
                 text: response.output,
-                usage: TokenUsage {
-                    input_tokens: response.usage.input_tokens,
-                    output_tokens: response.usage.output_tokens,
-                },
+                usage: TokenUsage::normalised(
+                    provider,
+                    response.usage.input_tokens,
+                    response.usage.cached_input_tokens,
+                    cache_writes.0.load(Ordering::Relaxed),
+                    response.usage.output_tokens,
+                ),
             }),
             Err(PromptError::MaxTurnsError { max_turns, .. }) => Err(LlmError::MaxTurns(max_turns)),
             Err(e) => Err(LlmError::Other(anyhow!("{e}"))),
@@ -274,6 +346,25 @@ mod tests {
         assert!(looks_like_placeholder("your_openai_key_here"));
         assert!(looks_like_placeholder("stub"));
         assert!(!looks_like_placeholder("sk-abc123"));
+    }
+
+    #[test]
+    fn cached_tokens_are_part_of_the_input_total_whatever_the_provider_reports() {
+        // Anthropic: 200 uncached + 9,000 read from cache.
+        let anthropic = TokenUsage::normalised(Provider::Anthropic, 200, 9_000, 0, 50);
+        assert_eq!((anthropic.input_tokens, anthropic.cached_input_tokens), (9_200, 9_000));
+        // OpenAI: 9,200 in total, of which 9,000 were cached.
+        let openai = TokenUsage::normalised(Provider::OpenAi, 9_200, 9_000, 0, 50);
+        assert_eq!(openai, anthropic);
+        // Seen live: the request that fills the cache reported 4 input tokens
+        // through rig, with 7,201 written to the cache and counted nowhere.
+        let first = TokenUsage::normalised(Provider::Anthropic, 4, 0, 7_201, 50);
+        assert_eq!((first.input_tokens, first.cached_input_tokens), (7_205, 0));
+
+        let mut total = TokenUsage::default();
+        total += anthropic;
+        total += openai;
+        assert_eq!((total.input_tokens, total.cached_input_tokens, total.output_tokens), (18_400, 18_000, 100));
     }
 
     #[test]
