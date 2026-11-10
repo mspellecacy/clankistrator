@@ -337,21 +337,50 @@ pub fn parse_findings(reply: &str, items: &[CheckItem]) -> Result<Vec<Answer>, S
     Ok(answers.into_iter().flatten().collect())
 }
 
+/// Why a reviewer's quote does not count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteProblem {
+    /// The named file is not a readable file in the project.
+    NoFile,
+    /// The quote is in the file but is only a fragment that could be anywhere.
+    TooShort,
+    NotFound,
+}
+
+/// A line with fewer letters and digits than this (`}`, `});`) says nothing.
+const MIN_LINE_ALPHANUMERICS: usize = 2;
+
 /// Is a line of `quote` really in `file`? Whitespace is ignored, and one
-/// substantial line that matches is enough, so elisions and reflowed code
-/// do not fail an honest quote.
-fn quote_found(sandbox: &Sandbox, file: &str, quote: &str) -> bool {
+/// matching line is enough, so indentation and a second line quoted for
+/// context do not fail an honest quote.
+///
+/// A quote counts if it is long enough to identify code, or if it is a whole
+/// line of the file (`fn main() {` is short, and is still the line). A file
+/// with nothing in it to quote needs no quote: that it exists is checked here.
+fn check_quote(sandbox: &Sandbox, file: &str, quote: &str) -> Result<(), QuoteProblem> {
     // Reviewers like to write "src/app.rs:52".
     let file = file.split(':').next().unwrap_or(file).trim();
-    let Ok(path) = sandbox.resolve(file) else { return false };
-    let Ok(content) = std::fs::read_to_string(path) else { return false };
+    let path = sandbox.resolve(file).map_err(|_| QuoteProblem::NoFile)?;
+    let content = std::fs::read_to_string(path).map_err(|_| QuoteProblem::NoFile)?;
     let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let says_something = |line: &str| line.chars().filter(|c| c.is_alphanumeric()).count() >= MIN_LINE_ALPHANUMERICS;
+
+    let file_lines: Vec<String> = content.lines().map(squash).filter(|line| says_something(line)).collect();
+    if file_lines.is_empty() && quote.trim().is_empty() {
+        return Ok(());
+    }
     let haystack = squash(&content);
-    quote
-        .lines()
-        .map(squash)
-        .filter(|line| line.chars().filter(|c| !c.is_whitespace()).count() >= MIN_QUOTE_CHARS)
-        .any(|line| haystack.contains(&line))
+    let mut problem = QuoteProblem::NotFound;
+    for line in quote.lines().map(squash).filter(|line| says_something(line)) {
+        let long_enough = line.chars().filter(|c| !c.is_whitespace()).count() >= MIN_QUOTE_CHARS;
+        if file_lines.contains(&line) || (long_enough && haystack.contains(&line)) {
+            return Ok(());
+        }
+        if haystack.contains(&line) {
+            problem = QuoteProblem::TooShort;
+        }
+    }
+    Err(problem)
 }
 
 /// The checks a program can make on a reviewer's answers, so that "met" is
@@ -373,16 +402,27 @@ pub fn audit(answers: Vec<Answer>, items: &[CheckItem], sandbox: &Sandbox) -> (V
             let Answer { mut finding, file, quote } = answer;
             match finding.status {
                 FindingStatus::Met if item.needs_quote => {
-                    let found = match (&file, &quote) {
-                        (Some(file), Some(quote)) => quote_found(sandbox, file, quote),
-                        _ => false,
+                    let checked = match &file {
+                        Some(file) => check_quote(sandbox, file, quote.as_deref().unwrap_or_default()),
+                        None => Err(QuoteProblem::NoFile),
                     };
-                    if !found {
-                        problems.push((i, format!(
-                            "Item {n}: you answered met, but the quote was not found in {}. Copy one line exactly \
-                             from the file that implements the item, or answer unmet.",
-                            file.as_deref().unwrap_or("any file (no file was named)")
-                        )));
+                    if let Err(problem) = checked {
+                        let named = file.as_deref().unwrap_or("(no file was named)");
+                        let what = match problem {
+                            QuoteProblem::NoFile => format!(
+                                "the file you named, {named}, is not a file in the project. Name the file, relative \
+                                 to the project root, and quote one line from it"
+                            ),
+                            QuoteProblem::TooShort => format!(
+                                "your quote is in {named} but is only a fragment of a line. Copy the whole line"
+                            ),
+                            QuoteProblem::NotFound => format!(
+                                "the quote was not found in {named}. Copy one line exactly from the file that \
+                                 implements the item (for an item about a file existing or a command succeeding: \
+                                 a line of the file it concerns)"
+                            ),
+                        };
+                        problems.push((i, format!("Item {n}: you answered met, but {what}, or answer unmet.")));
                         finding.status = FindingStatus::Unmet;
                         finding.evidence = format!(
                             "The reviewer called this met but could not quote code in the project that implements it. Its claim: {}",
@@ -901,12 +941,56 @@ mod tests {
             r#"[{"id":1,"status":"met","file":"src/nope.rs","quote":"KeyCode::Esc => return,","evidence":"x"}]"#,
             r#"[{"id":1,"status":"met","file":"../../etc/passwd","quote":"root:x:0:0:root","evidence":"x"}]"#,
             r#"[{"id":1,"status":"met","file":"src/app.rs","quote":"}","evidence":"too short to mean anything"}]"#,
+            // A fragment that could be anywhere, and no quote from a file that has code to quote.
+            r#"[{"id":1,"status":"met","file":"src/app.rs","quote":"KeyCode","evidence":"keys are handled"}]"#,
+            r#"[{"id":1,"status":"met","file":"src/app.rs","quote":"","evidence":"it is all there"}]"#,
         ] {
             let (findings, problems) = audited(reply, &item);
             assert_eq!(findings[0].status, FindingStatus::Unmet, "{reply}");
             assert_eq!(problems.len(), 1, "{reply}");
             assert!(findings[0].evidence.contains("could not quote code"), "{}", findings[0].evidence);
         }
+    }
+
+    /// Seen live: a planner asked for a project skeleton ("src/lib.rs exists
+    /// (can be empty)", "src/main.rs exists"), the worker built it, the
+    /// reviewer said so, and the quote check failed the task four times.
+    #[test]
+    fn a_correct_review_of_a_project_skeleton_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path().join("out"), Duration::from_secs(5)).unwrap();
+        let write = |file: &str, content: &str| {
+            let path = sandbox.root().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+        write("src/lib.rs", "");
+        write("src/main.rs", "fn main() {\n    // Placeholder main for now\n}");
+        write("Cargo.toml", "[package]\nname = \"sumcli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+
+        let item = items(1);
+        let check = |file: &str, quote: &str| {
+            let reply = json!([{"id": 1, "status": "met", "file": file, "quote": quote, "evidence": "it exists"}]);
+            let (findings, problems) = audit(parse_findings(&reply.to_string(), &item).unwrap(), &item, &sandbox);
+            (findings[0].status, problems.into_iter().map(|(_, text)| text).collect::<String>())
+        };
+        // A whole line counts however short it is.
+        assert_eq!(check("src/main.rs", "fn main() {").0, FindingStatus::Met);
+        // An empty file has nothing to quote; that it exists is what was checked.
+        assert_eq!(check("src/lib.rs", "").0, FindingStatus::Met);
+        assert_eq!(check("Cargo.toml", "name = \"sumcli\"").0, FindingStatus::Met);
+
+        // The reviewer is told what is actually wrong, so that it can correct it.
+        let (status, problem) = check("src/main.rs", "main()");
+        assert_eq!(status, FindingStatus::Unmet);
+        assert!(problem.contains("only a fragment"), "{problem}");
+        let (status, problem) = check("src/missing.rs", "");
+        assert_eq!(status, FindingStatus::Unmet);
+        assert!(problem.contains("is not a file in the project"), "{problem}");
+        // A quote that is not in an empty file is still not in it.
+        assert_eq!(check("src/lib.rs", "pub fn sum(numbers: &[i64]) -> i64 {").0, FindingStatus::Unmet);
+        // Closing punctuation is a whole line too, and still says nothing.
+        assert_eq!(check("src/main.rs", "}").0, FindingStatus::Unmet);
     }
 
     #[test]

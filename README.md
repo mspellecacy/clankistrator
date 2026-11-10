@@ -98,7 +98,7 @@ A model is named as `prefix:model`. For three providers the prefix can be left o
 | Anthropic | `anthropic:` (optional) | `ANTHROPIC_API_KEY` | yes: probe and full runs |
 | Gemini | `gemini:` (optional) | `GEMINI_API_KEY` | no |
 | Ollama | `ollama:` | a running server; `OLLAMA_BASE_URL` if it is not on `http://localhost:11434` | no |
-| OpenRouter | `openrouter:` | `OPENROUTER_API_KEY` (or `OPENROUTER_KEY`) | probe only, with two free models (see below) |
+| OpenRouter | `openrouter:` | `OPENROUTER_API_KEY` (or `OPENROUTER_KEY`) | probe with two free models; planning and one task built on a free model, no full run finished (see below) |
 | OpenAI-compatible server | `compatible:` | `OPENAI_COMPATIBLE_BASE_URL` (for example `http://localhost:1234/v1`); `OPENAI_COMPATIBLE_API_KEY` if the server wants one | no |
 
 "Run live" says whether that path has been exercised against the real service by the maintainers. The rows marked "no" compile and are wired up the same way, but nobody has seen them work; probe before you trust them. "Probe only" means a request and a tool call went through, and no full run has been made.
@@ -123,7 +123,7 @@ OpenRouter offers some models at no charge; their names end in `:free`, for exam
 
 What to know before relying on them:
 
-- **The allowance is counted in requests.** An account that has never bought credits gets 50 free-model requests a day and 20 a minute; one that has bought 10 credits gets 1,000 a day. Every turn of an agent is one request, and a task takes a worker and a reviewer several turns each, so 50 requests do not go far. A run says at the start how many OpenRouter reports are left for the day, and its summary says how many it sent. Using the free model only to build (`--model`) and another provider to review (`--review-model`) halves the requests.
+- **The allowance is counted in requests.** An account that has never bought credits gets 50 free-model requests a day and 20 a minute; one that has bought 10 credits gets 1,000 a day. Every turn of an agent is one request, and a task takes a worker and a reviewer several turns each, so 50 requests do not go far: in the one run measured, a worker took about 10 requests for a task as small as creating a project skeleton. A run says at the start how many OpenRouter reports are left for the day, and its summary says how many it sent. Using the free model only to build (`--model`) and another provider to review (`--review-model`) halves the requests.
 - **Clankistrator spaces requests to free models** about 3 seconds apart, across all agents, to stay under the per-minute limit. Runs are slower for it.
 - **When the day's allowance is used up,** a run refuses to start, and a run already under way fails its remaining tasks quickly and ends with exit code 1. (OpenRouter answers a used-up day and a busy minute with the same error, so after a rate-limit error Clankistrator asks OpenRouter for the day's counter.) The state is saved; `--resume` after the counter resets, at midnight UTC, continues it.
 - **To make sure nothing is ever billed,** set `OPENROUTER_FREE_ONLY=true`. Any `openrouter:` model whose name does not end in `:free` is then refused before a request is sent.
