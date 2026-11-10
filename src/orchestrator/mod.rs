@@ -88,14 +88,72 @@ pub fn parse_plan(reply: &str) -> Result<Vec<ProjectTask>, String> {
     Ok(tasks)
 }
 
+/// What the harness knows about each worker model, for a model that has to
+/// choose between them. A model's name alone may mean nothing to it.
+pub fn describe_pool(ctx: &ProjectContext) -> String {
+    let free_left = ctx.free_requests_at_start.map(|left| left.saturating_sub(crate::llm::free_model_requests()));
+    ctx.pool()
+        .iter()
+        .map(|model| {
+            let mut facts: Vec<String> = Vec::new();
+            if crate::llm::uses_free_tier(&[model]) {
+                facts.push(match free_left {
+                    Some(left) => format!(
+                        "free of charge, but all free models together have about {left} requests left today"
+                    ),
+                    None => "free of charge, but limited to a small number of requests a day".to_string(),
+                });
+                facts.push("one attempt at a small task takes about 10 requests".to_string());
+            } else {
+                facts.push("paid".to_string());
+            }
+            if let Some(used) = ctx.model_usage.get(*model)
+                && used.passed + used.rejected > 0
+            {
+                facts.push(format!(
+                    "so far in this run {} of its task attempts passed review and {} failed",
+                    used.passed, used.rejected
+                ));
+            }
+            if let Some((_, reason)) = ctx.retired_models.iter().find(|(retired, _)| retired == model) {
+                facts.push(format!("CANNOT BE USED in this run ({})", truncate(reason, 120)));
+            }
+            format!("- {model}: {}\n", facts.join("; "))
+        })
+        .collect()
+}
+
+/// The worker models a planner may assign, and what is known about them.
+#[derive(Debug, Clone, Default)]
+pub struct WorkerChoice {
+    /// Names the plan may use. Empty: tasks are not assigned by the planner.
+    pub models: Vec<String>,
+    pub facts: String,
+}
+
+impl WorkerChoice {
+    /// Assignment is only asked for when there is something to choose between.
+    pub fn of(ctx: &ProjectContext) -> Self {
+        let models: Vec<String> = ctx.usable_pool().iter().map(|m| m.to_string()).collect();
+        if models.len() < 2 { Self::default() } else { Self { models, facts: describe_pool(ctx) } }
+    }
+}
+
 /// Ask the model to decompose a design document into tasks.
 pub async fn plan_tasks(
     llm: &dyn Llm,
     model: &str,
     design: &str,
     sandbox: &Sandbox,
+    workers: &WorkerChoice,
 ) -> Result<(Vec<ProjectTask>, TokenUsage, u64)> {
-    let base_prompt = format!("{}\nDesign document:\n\n{}", prompts::PLANNING_INSTRUCTIONS, design);
+    let assignment = if workers.models.is_empty() {
+        String::new()
+    } else {
+        format!("{}{}", prompts::WORKER_MODELS_INSTRUCTIONS, workers.facts)
+    };
+    let base_prompt =
+        format!("{}{assignment}\nDesign document:\n\n{}", prompts::PLANNING_INSTRUCTIONS, design);
     let mut usage = TokenUsage::default();
     let mut calls = 0;
     let mut problem = String::new();
@@ -124,8 +182,25 @@ pub async fn plan_tasks(
         usage += reply.usage;
 
         match parse_plan(&reply.text) {
-            Ok(tasks) => {
+            Ok(mut tasks) => {
                 tracing::info!("Planner: produced {} tasks", tasks.len());
+                for task in &mut tasks {
+                    match &task.model {
+                        Some(chosen) if workers.models.contains(chosen) => {
+                            tracing::info!("Planner: {} ({}) goes to {chosen}", task.id, task.title);
+                        }
+                        Some(unknown) => {
+                            // Not worth another planning call: the default order applies.
+                            tracing::warn!(
+                                "Planner: {} was given to {unknown:?}, which is not one of the worker models; \
+                                 it starts on the first usable one instead",
+                                task.id
+                            );
+                            task.model = None;
+                        }
+                        None => {}
+                    }
+                }
                 return Ok((tasks, usage, calls));
             }
             Err(e) => {
@@ -512,14 +587,14 @@ impl Orchestrator {
     async fn run_inner(&self, context: &SharedContext, hitl: Hitl) -> Result<RunEnd> {
         let needs_plan = context.lock().await.tasks.is_empty();
         if needs_plan {
-            let model = {
+            let (model, workers) = {
                 let mut ctx = context.lock().await;
                 ctx.phase = RunPhase::Planning;
-                ctx.model.clone()
+                (ctx.planner_model().to_string(), WorkerChoice::of(&ctx))
             };
-            tracing::info!("Orchestrator: planning tasks from the design document");
+            tracing::info!("Orchestrator: planning tasks from the design document with {model}");
             let (tasks, usage, calls) =
-                plan_tasks(self.llm.as_ref(), &model, &self.design_doc, &self.sandbox).await?;
+                plan_tasks(self.llm.as_ref(), &model, &self.design_doc, &self.sandbox, &workers).await?;
             let mut ctx = context.lock().await;
             record_usage(&mut ctx, &model, usage, calls);
             ctx.tasks = tasks;
@@ -1450,6 +1525,68 @@ mod tests {
         assert!(ctx.tasks.iter().all(|t| t.retries == 0));
         assert!(ctx.is_retired("free") && !ctx.is_retired("paid"));
         assert!(ctx.retired_models[0].1.contains("allowance for today is used up"));
+    }
+
+    const ASSIGNED_PLAN: &str = r#"[
+        {"id":"TASK-1","title":"Set up","description":"Create the project","dependencies":[],"assigned_role":"Infrastructure",
+         "acceptance_criteria":["Cargo.toml exists in the project root"],"model":"cheap"},
+        {"id":"TASK-2","title":"Parser","description":"Implement the parser","dependencies":["TASK-1"],"assigned_role":"Backend",
+         "acceptance_criteria":["`sum(&[])` returns Ok(0.0)"],"model":"strong"},
+        {"id":"TASK-3","title":"Docs","description":"Write the README","dependencies":["TASK-2"],"assigned_role":"Backend",
+         "acceptance_criteria":["README.md exists"],"model":"a-model-nobody-offered"}
+    ]"#;
+
+    #[tokio::test]
+    async fn the_advisor_plans_assigns_each_task_to_a_worker_model_and_reviews() {
+        let llm = ScriptedLlm::new(|kind, request, earlier| match kind {
+            Kind::Plan => Ok(ASSIGNED_PLAN.to_string()),
+            Kind::DesignCheck if earlier == 0 => {
+                Ok(unmet_if(&request.prompt, "Enter evaluates", "src/app.rs:52 only handles '='"))
+            }
+            _ => agreeable(kind, request, earlier),
+        });
+        let (_dir, orchestrator, context) = setup(llm.clone(), true, 50);
+        {
+            let mut ctx = context.lock().await;
+            ctx.worker_models = vec!["cheap".into(), "strong".into()];
+            ctx.advisor_model = Some("lead".into());
+            ctx.model_usage.entry("cheap".into()).or_default().passed = 3;
+        }
+
+        assert_eq!(orchestrator.run(&context, Hitl::Stdin).await.unwrap(), RunEnd::Finished);
+
+        // The advisor plans, knowing what the harness knows about the models.
+        let plan = &llm.requests(Kind::Plan)[0];
+        assert_eq!(plan.model, "lead");
+        assert!(plan.prompt.contains("# Worker models"));
+        assert!(plan.prompt.contains("- cheap: paid; so far in this run 3 of its task attempts passed review and 0 failed"));
+        assert!(plan.prompt.contains("- strong: paid\n"), "{}", plan.prompt);
+
+        // Tasks run where the plan put them; a model nobody offered falls back to the
+        // first worker model; the fix task goes to the strongest.
+        assert_eq!(worker_models(&llm), ["cheap", "strong", "cheap", "strong"]);
+        let ctx = context.lock().await;
+        assert!(ctx.get_task("TASK-4").unwrap().title.starts_with("Fix unmet design requirements"));
+        assert!(ctx.succeeded());
+
+        // With no review model named, the advisor is the judge. It never builds.
+        for judged in [Kind::Review, Kind::Requirements, Kind::DesignCheck] {
+            assert!(llm.requests(judged).iter().all(|r| r.model == "lead"), "{judged:?}");
+        }
+        assert_eq!(ctx.model_usage["lead"].passed + ctx.model_usage["lead"].rejected, 0);
+    }
+
+    #[tokio::test]
+    async fn a_single_worker_model_is_not_offered_as_a_choice() {
+        let llm = ScriptedLlm::new(agreeable);
+        let (_dir, orchestrator, context) = setup(llm.clone(), true, 50);
+        context.lock().await.advisor_model = Some("lead".into());
+
+        assert_eq!(orchestrator.run(&context, Hitl::Stdin).await.unwrap(), RunEnd::Finished);
+        let plan = &llm.requests(Kind::Plan)[0];
+        assert_eq!(plan.model, "lead");
+        assert!(!plan.prompt.contains("# Worker models"));
+        assert_eq!(worker_models(&llm), ["test-model", "test-model"]);
     }
 
     /// Seen live: a correct review was overruled by the quote check four times.

@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::context::ProjectContext;
 use crate::llm::{Llm, check_credentials};
-use crate::orchestrator::plan_tasks;
+use crate::orchestrator::{WorkerChoice, plan_tasks};
 use crate::parser::markdown::MarkdownParser;
 use crate::tools::Sandbox;
 
@@ -115,7 +115,8 @@ impl McpServer {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Path to the Markdown design document." },
-                        "model": { "type": "string", "description": "Model to use instead of the server default." }
+                        "model": { "type": "string", "description": "Model to use instead of the server default." },
+                        "workers": { "type": "array", "items": { "type": "string" }, "description": "Worker models, cheapest first. With two or more, the plan assigns each task to one of them." }
                     },
                     "required": ["path"]
                 }
@@ -173,7 +174,20 @@ impl McpServer {
         check_credentials(model).map_err(|e| e.to_string())?;
         // Planning uses no tools; the sandbox is only a formality here.
         let sandbox = Sandbox::new(std::env::temp_dir(), Duration::from_secs(1)).map_err(|e| e.to_string())?;
-        let (tasks, usage, _) = plan_tasks(self.llm.as_ref(), model, &design, &sandbox)
+        let pool: Vec<String> = args
+            .get("workers")
+            .and_then(Value::as_array)
+            .map(|models| models.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        let workers = if pool.len() < 2 {
+            WorkerChoice::default()
+        } else {
+            let mut ctx =
+                ProjectContext::new(String::new(), std::env::temp_dir(), 0, 1, false, model.to_string());
+            ctx.worker_models = pool;
+            WorkerChoice::of(&ctx)
+        };
+        let (tasks, usage, _) = plan_tasks(self.llm.as_ref(), model, &design, &sandbox, &workers)
             .await
             .map_err(|e| format!("{e:#}"))?;
         let tasks: Vec<Value> = tasks
@@ -186,6 +200,7 @@ impl McpServer {
                     "assigned_role": t.assigned_role,
                     "dependencies": t.dependencies,
                     "acceptance_criteria": t.acceptance_criteria,
+                    "model": t.model,
                 })
             })
             .collect();

@@ -71,6 +71,11 @@ struct Args {
     #[arg(long)]
     review_model: Option<String>,
 
+    /// A stronger model that leads the run: it plans, assigns each task to one of the --workers
+    /// models, and reviews unless --review-model names another model
+    #[arg(long)]
+    advisor_model: Option<String>,
+
     /// Models that may build, cheapest first, separated by commas. A task starts on the first
     /// and moves to the next after two failed attempts, or at once if a model becomes unusable
     /// (for example when a free allowance runs out). Without this, only --model builds
@@ -206,6 +211,9 @@ async fn run() -> Result<ExitCode> {
         if let Some(workers) = worker_pool(&args) {
             ctx.worker_models = workers;
         }
+        if args.advisor_model.is_some() {
+            ctx.advisor_model = args.advisor_model.clone();
+        }
         if let Some(max_steps) = args.max_steps {
             ctx.max_steps = max_steps;
         }
@@ -237,13 +245,14 @@ async fn run() -> Result<ExitCode> {
                 .unwrap_or_else(default_model),
         );
         ctx.worker_models = worker_pool(&args).unwrap_or_default();
+        ctx.advisor_model = args.advisor_model.clone();
         ctx.review_model = args.review_model.clone();
         ctx.fix_rounds = args.fix_rounds.unwrap_or(DEFAULT_FIX_ROUNDS);
         ctx.design_check_enabled = !args.skip_design_check;
         ctx
     };
 
-    check_credentials(&context.model)?;
+    check_credentials(context.planner_model())?;
     check_credentials(context.reviewer_model())?;
     for model in context.pool() {
         check_credentials(model)?;
@@ -276,10 +285,11 @@ async fn run() -> Result<ExitCode> {
         );
     }
     tracing::info!("Clankistrator: model {}, output directory {}", context.model, output_dir.display());
-    if context.pool().len() > 1 {
+    if context.pool().len() > 1 || context.advisor_model.is_some() {
         tracing::info!(
-            "Clankistrator: worker models, cheapest first: {}. Reviews by {}",
+            "Clankistrator: worker models, cheapest first: {}. Planning by {}, reviews by {}",
             context.pool().join(", "),
+            context.planner_model(),
             context.reviewer_model()
         );
     }
@@ -299,7 +309,7 @@ async fn run() -> Result<ExitCode> {
     let mut context = context;
     let pool: Vec<String> = context.pool().iter().map(|m| m.to_string()).collect();
     // Models the run cannot do without: the planner and the reviewer.
-    let required = [context.model.clone(), context.reviewer_model().to_string()];
+    let required = [context.planner_model().to_string(), context.reviewer_model().to_string()];
     let is_free = |model: &str| llm::uses_free_tier(&[model]);
 
     if pool.iter().chain(&required).any(|model| is_free(model)) {
@@ -309,7 +319,7 @@ async fn run() -> Result<ExitCode> {
                 let has_other_workers = pool.iter().any(|model| !is_free(model));
                 // The reviewer is always needed; the planner only while there is no plan yet.
                 let needed = is_free(context.reviewer_model())
-                    || (context.tasks.is_empty() && is_free(&context.model));
+                    || (context.tasks.is_empty() && is_free(context.planner_model()));
                 if !has_other_workers || needed {
                     bail!("{}", llm::FREE_ALLOWANCE_USED_UP);
                 }
@@ -319,10 +329,13 @@ async fn run() -> Result<ExitCode> {
                 "OpenRouter reports none of today's free-model requests left, so the free models sit this run out"
                     .to_string()
             }
-            Some(allowance) => format!(
-                "OpenRouter reports {} of today's {} free-model requests left",
-                allowance.remaining, allowance.limit
-            ),
+            Some(allowance) => {
+                context.free_requests_at_start = Some(allowance.remaining);
+                format!(
+                    "OpenRouter reports {} of today's {} free-model requests left",
+                    allowance.remaining, allowance.limit
+                )
+            }
             None => "OpenRouter did not say how many free-model requests are left today".to_string(),
         };
         tracing::warn!(

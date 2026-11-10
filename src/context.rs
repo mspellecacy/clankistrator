@@ -275,6 +275,13 @@ pub struct ProjectContext {
     /// Calls, tokens and results per model.
     #[serde(default)]
     pub model_usage: BTreeMap<String, ModelUsage>,
+    /// A stronger model that plans, assigns tasks to worker models and, unless
+    /// a review model is set, reviews.
+    #[serde(default)]
+    pub advisor_model: Option<String>,
+    /// OpenRouter's count of free-model requests left when the run started.
+    #[serde(skip)]
+    pub free_requests_at_start: Option<u64>,
 }
 
 fn enabled() -> bool {
@@ -332,7 +339,14 @@ impl ProjectContext {
             worker_models: Vec::new(),
             retired_models: Vec::new(),
             model_usage: BTreeMap::new(),
+            advisor_model: None,
+            free_requests_at_start: None,
         }
+    }
+
+    /// The model that plans: the advisor if there is one.
+    pub fn planner_model(&self) -> &str {
+        self.advisor_model.as_deref().unwrap_or(&self.model)
     }
 
     /// The worker models in the order given (cheapest first).
@@ -399,7 +413,7 @@ impl ProjectContext {
 
     /// The model used for reviews and the design check.
     pub fn reviewer_model(&self) -> &str {
-        self.review_model.as_deref().unwrap_or(&self.model)
+        self.review_model.as_deref().or(self.advisor_model.as_deref()).unwrap_or(&self.model)
     }
 
     /// Requirements the latest design check found unmet.

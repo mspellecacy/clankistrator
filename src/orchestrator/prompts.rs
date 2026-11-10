@@ -19,6 +19,16 @@ Each task is an object with:
 Output ONLY the raw JSON list, with no commentary and no markdown fences.
 "#;
 
+pub const WORKER_MODELS_INSTRUCTIONS: &str = r#"
+# Worker models
+
+Each task is carried out by one of the models below, which are listed from cheapest to most capable. Give every task a "model" field naming the model that should do it, written exactly as it is written here.
+
+Choose the cheapest model that can be expected to do the task well. Mechanical work with an obvious result (creating the project, configuration, a small well-specified function) suits the cheapest model. Work where a subtle mistake is likely (parsing, state machines, input handling, terminal or network setup, anything the rest of the project depends on) suits a more capable one. A task that fails twice on its model is moved to the next model automatically, so do not pick the most capable model out of caution alone. A model with a limited number of requests cannot do everything: count roughly what your plan would need from it and give it only what fits.
+
+What is known about the models:
+"#;
+
 pub const INFRASTRUCTURE_SYSTEM_PROMPT: &str = r#"
 You are a specialized Infrastructure Architect.
 Your job is to set up the project structure, manage the file system, and handle configuration files like Cargo.toml or Dockerfile.
