@@ -75,7 +75,9 @@ The summary reports input tokens as one total, with the part read from the cache
 | `-S, --max-steps <N>` | 50 | Orchestration passes that ran or reviewed a task; 0 is unlimited. Waiting for approval costs nothing |
 | `--max-turns <N>` | 40 | Model turns (tool-call rounds) per worker attempt |
 | `--command-timeout <SECS>` | 300 | Time limit for a command started by an agent |
-| `--review-model <MODEL>` | same as `--model` | Model for reviews and the design check. A stronger model here is the cheapest way to a stricter gate |
+| `--review-model <MODEL>` | the advisor, else `--model` | Model for reviews and the design check. A stronger model here is the cheapest way to a stricter gate |
+| `--workers <MODEL,MODEL>` | only `--model` | Models that may build, cheapest first. See "An advisor and several worker models" |
+| `--advisor-model <MODEL>` | none | A stronger model that plans, assigns tasks to the worker models, advises after a failed attempt, and reviews unless `--review-model` is set |
 | `--fix-rounds <N>` | 2 | How many times unmet design requirements are turned into a fix task |
 | `--skip-design-check` | off | Do not check the finished project against the design |
 | `--no-prompt-cache` | off | Do not ask Anthropic to cache prompts between an agent's turns |
@@ -106,6 +108,31 @@ A model is named as `prefix:model`. For three providers the prefix can be left o
 Examples: `--model gpt-4o`, `--model ollama:qwen2.5-coder:14b`, `--model openrouter:vendor/model-name`, `--model compatible:whatever-your-server-calls-it`. OpenRouter and OpenAI-compatible servers are how to reach providers that have no row of their own.
 
 Workers and reviewers can use different models, from different providers: `--model` builds, `--review-model` judges. A cheaper model that builds with a stronger one that reviews is a reasonable combination.
+
+#### An advisor and several worker models
+
+One strong model can lead a run while cheaper ones do the building:
+
+```bash
+cargo run --release -- --design design.md --output ../my-project \
+  --advisor-model claude-sonnet-5-5 \
+  --workers openrouter:cohere/north-mini-code:free,gpt-4o,claude-sonnet-5-5
+```
+
+`--workers` lists the models that may build, **cheapest first**. Only the models you name are used; having a key for a provider does not put its models in the pool. `--advisor-model` is the lead. It never writes the project's files. What each part does:
+
+- **Planning and assignment.** The advisor writes the plan and gives each task to one of the worker models. A model's name may mean nothing to it, so it is told what Clankistrator knows: the order, which models are free and how many free requests are left today, and how each model's attempts have fared so far in the run.
+- **Stepping up.** A task that fails twice on its model moves to the next one in the list. This works without an advisor too. A task still gets four attempts in all, whatever models make them.
+- **Advice after a failure.** When an attempt fails (the reviewer found something unmet, or the worker gave up), the advisor reads the project, with read-only tools, and writes guidance for the next attempt: the cause and the exact change. It can also move the task to another worker model. It is consulted at most twice per task. Its answers are kept in `.clankistrator/transcripts/<task>.advice.*.md`.
+- **A model that stops working** during a run (a used-up free allowance, a revoked key) is left out for the rest of the run, and its task goes to the next model without losing an attempt.
+- **Fix tasks** from the design check go to the last model in the list, because they are what the earlier work missed.
+- **Reviews** are done by the advisor unless `--review-model` names another model.
+
+The run summary lists calls, tokens and passed and failed attempts per model, so you can see where the work went and what was paid for. Each consultation is a multi-turn run of your most expensive model; that is the price of the cheaper models' failures. A review whose only problem is that the reviewer did not show its evidence is not treated as a failure of the worker: no advice is asked and the task stays where it is.
+
+Not built: a tool that lets a worker ask the advisor a question in the middle of its own attempt. The advisor is consulted by Clankistrator at fixed points, not by the workers.
+
+Run live so far: planning and assignment (through the MCP `plan_tasks` tool). Stepping up, fallback and advice are covered by tests against scripted models and have not yet been seen in a real run.
 
 #### Checking that a model works
 
@@ -141,7 +168,7 @@ Settings are read from the environment, `.env.local` and `.env` (in that order o
 | `1`-`4`, `Tab` | Switch between Tasks, Logs, HITL and Stats |
 | `↑` `↓` | Select a task; its description, summary, error and feedback show on the right |
 | `a` / `r` (HITL) | Approve, or reject with typed feedback for the worker |
-| `m` | Menu: brave mode, model, max steps. Changes apply to agents started afterwards |
+| `m` | Menu: brave mode, model, max steps. Changes apply to agents started afterwards. The model set here is `--model`; with `--workers`, the worker models stay as given |
 | `PgUp` `PgDn` `Esc` (Logs) | Scroll, return to following |
 | `q`, `Ctrl-C` | Quit. Progress is saved; continue with `--resume` |
 

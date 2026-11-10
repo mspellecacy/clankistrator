@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 
 use crate::agents::{self, AgentSettings, ReviewVerdict, WorkerOutcome};
 use crate::context::{
-    AgentRole, Finding, MAX_RETRIES, Requirement, ProjectContext, ProjectTask, RunPhase, STATE_DIR, TaskDef,
+    AgentRole, Finding, MAX_CONSULTS, MAX_RETRIES, Requirement, ProjectContext, ProjectTask, RunPhase, STATE_DIR, TaskDef,
     TaskStatus, validate_task_graph, STEP_UP_AFTER,
 };
 use crate::llm::{AgentRequest, Llm, TokenUsage};
@@ -341,8 +341,12 @@ fn record_usage(ctx: &mut ProjectContext, model: &str, usage: TokenUsage, calls:
 /// task cannot go round the pool for ever.
 fn note_failed_attempt(ctx: &mut ProjectContext, task_id: &str, model: &str) {
     ctx.model_usage.entry(model.to_string()).or_default().rejected += 1;
+    let has_advisor = ctx.advisor_model.is_some();
     let Some(failures) = ctx.get_task_mut(task_id).map(|t| {
         t.failures_on_model += 1;
+        if has_advisor && t.consults < MAX_CONSULTS {
+            t.advice_wanted_after = Some(model.to_string());
+        }
         t.failures_on_model
     }) else {
         return;
@@ -358,6 +362,31 @@ fn note_failed_attempt(ctx: &mut ProjectContext, task_id: &str, model: &str) {
             t.model = Some(next);
             t.failures_on_model = 0;
         }
+    }
+}
+
+/// Give the advisor's guidance to the worker, and the task to the model the advisor chose.
+fn apply_advice(ctx: &mut ProjectContext, task_id: &str, next_model: &str, advice: agents::Advice) {
+    let chosen = advice.model.filter(|model| model != next_model);
+    let usable = chosen.as_ref().is_some_and(|model| ctx.usable_pool().contains(&model.as_str()));
+    let Some(t) = ctx.get_task_mut(task_id) else { return };
+    let earlier = t.feedback.take().unwrap_or_default();
+    t.feedback = Some(format!(
+        "{earlier}\n\n# Advice from the lead engineer\n\n\
+         The lead engineer looked at the project after that attempt failed. Follow this advice:\n\n{}",
+        advice.guidance
+    ));
+    match chosen {
+        Some(model) if usable => {
+            tracing::warn!("Orchestrator [{task_id}]: the advisor moved the task from {next_model} to {model}");
+            t.model = Some(model);
+            t.failures_on_model = 0;
+        }
+        Some(model) => tracing::warn!(
+            "Orchestrator [{task_id}]: the advisor named {model:?}, which is not a usable worker model; \
+             the task stays on {next_model}"
+        ),
+        None => tracing::info!("Orchestrator [{task_id}]: the advisor gave guidance; the next attempt runs on {next_model}"),
     }
 }
 
@@ -873,6 +902,63 @@ impl Orchestrator {
             save(&ctx);
         }
 
+        // 3. Advice. A task whose attempt failed is looked at by the advisor
+        // before it is tried again. The step-up rule has already been applied,
+        // so if the advisor cannot be reached the task still moves on sensibly.
+        let (advisor, to_advise, pool_facts) = {
+            let mut ctx = context.lock().await;
+            let advisor = ctx.advisor_model.clone();
+            let mut to_advise: Vec<(ProjectTask, String, String)> = Vec::new();
+            for index in 0..ctx.tasks.len() {
+                let Some(failed_on) = ctx.tasks[index].advice_wanted_after.take() else { continue };
+                if advisor.is_none() || ctx.tasks[index].status != TaskStatus::Pending {
+                    continue;
+                }
+                ctx.tasks[index].consults += 1;
+                let next = ctx.worker_model_for(&ctx.tasks[index]);
+                to_advise.push((ctx.tasks[index].clone(), failed_on, next));
+            }
+            (advisor, to_advise, describe_pool(&ctx))
+        };
+        if let Some(advisor) = advisor {
+            let mut advising = JoinSet::new();
+            for (task, failed_on, next) in to_advise {
+                let llm = Arc::clone(&self.llm);
+                let semaphore = Arc::clone(&self.semaphore);
+                let settings = settings.clone();
+                let advisor = advisor.clone();
+                let pool_facts = pool_facts.clone();
+                advising.spawn(async move {
+                    let _permit = semaphore.acquire().await.expect("semaphore is never closed");
+                    let attempt = agents::FailedAttempt {
+                        task: &task,
+                        model: &failed_on,
+                        next_model: &next,
+                        pool_facts: &pool_facts,
+                    };
+                    let run = agents::advise(llm.as_ref(), &advisor, &attempt, &settings).await;
+                    (task.id, next, run)
+                });
+            }
+            while let Some(joined) = advising.join_next().await {
+                let mut ctx = context.lock().await;
+                match joined {
+                    Ok((task_id, next, run)) => {
+                        save_transcript(self.sandbox.root(), &format!("{task_id}.advice"), run.reply.as_deref());
+                        record_usage(&mut ctx, &advisor, run.usage, run.calls);
+                        match run.outcome {
+                            Ok(advice) => apply_advice(&mut ctx, &task_id, &next, advice),
+                            Err(e) => tracing::warn!(
+                                "Orchestrator [{task_id}]: no advice could be had ({e}); the next attempt goes ahead without it"
+                            ),
+                        }
+                    }
+                    Err(e) => tracing::error!("Orchestrator: the advisor crashed: {e}"),
+                }
+                save(&ctx);
+            }
+        }
+
         {
             let mut ctx = context.lock().await;
             // A crashed reviewer leaves its task Reviewing; queue it for review again.
@@ -946,11 +1032,13 @@ mod tests {
         Worker,
         Review,
         DesignCheck,
+        Advice,
     }
 
     fn kind(request: &AgentRequest) -> Kind {
         match request.tools {
             ToolAccess::Full => Kind::Worker,
+            ToolAccess::Inspect if request.prompt.starts_with("# Advice wanted") => Kind::Advice,
             ToolAccess::Inspect if request.prompt.contains("# Whole-project check") => Kind::DesignCheck,
             ToolAccess::Inspect => Kind::Review,
             ToolAccess::None if request.prompt.contains("checklist for verifying") => Kind::Requirements,
@@ -1049,6 +1137,7 @@ mod tests {
             Kind::Plan => TWO_TASK_PLAN.to_string(),
             Kind::Requirements => REQUIREMENTS.to_string(),
             Kind::Worker => DONE.to_string(),
+            Kind::Advice => r#"{"diagnosis": "the import is missing", "guidance": "add `use std::fmt;` to src/lib.rs"}"#.to_string(),
             Kind::Review | Kind::DesignCheck => all_met(&request.prompt),
         })
     }
@@ -1589,6 +1678,99 @@ mod tests {
         assert_eq!(worker_models(&llm), ["test-model", "test-model"]);
     }
 
+    #[tokio::test]
+    async fn the_advisor_looks_at_a_failed_attempt_and_its_guidance_reaches_the_worker() {
+        let llm = ScriptedLlm::new(|kind, request, earlier| {
+            Ok(match kind {
+                Kind::Worker => signed(request),
+                // The first attempt is rejected; with the advice followed, the second passes.
+                Kind::Review if earlier == 0 => unmet_if(&request.prompt, "builds", "error[E0425]: cannot find `fmt`"),
+                _ => agreeable(kind, request, earlier)?,
+            })
+        });
+        let (_dir, orchestrator, context) = setup(llm.clone(), true, 50);
+        {
+            let mut ctx = context.lock().await;
+            ctx.worker_models = vec!["cheap".into(), "strong".into()];
+            ctx.advisor_model = Some("lead".into());
+        }
+
+        assert_eq!(orchestrator.run(&context, Hitl::Stdin).await.unwrap(), RunEnd::Finished);
+
+        let advice = llm.requests(Kind::Advice);
+        assert_eq!(advice.len(), 1);
+        assert_eq!(advice[0].model, "lead");
+        assert_eq!(advice[0].tools, ToolAccess::Inspect, "the advisor can look but not write");
+        assert!(advice[0].prompt.contains("error[E0425]: cannot find `fmt`"));
+        assert!(advice[0].prompt.contains("failed attempt 1 of at most 4, made by cheap"));
+        assert!(advice[0].prompt.contains("- cheap: paid; so far in this run 0 of its task attempts passed review and 1 failed"));
+        assert!(advice[0].prompt.contains("The next attempt is set to run on cheap."));
+
+        let workers = llm.requests(Kind::Worker);
+        assert_eq!(worker_models(&llm), ["cheap", "cheap", "cheap"], "the advisor left the model alone");
+        assert!(!workers[0].prompt.contains("lead engineer"));
+        assert!(workers[1].prompt.contains("error[E0425]"), "the reviewer's finding is still there");
+        assert!(workers[1].prompt.contains("# Advice from the lead engineer"));
+        assert!(workers[1].prompt.contains("What went wrong: the import is missing"));
+        assert!(workers[1].prompt.contains("What to do: add `use std::fmt;` to src/lib.rs"));
+        assert!(!workers[2].prompt.contains("lead engineer"), "the next task starts clean");
+
+        let ctx = context.lock().await;
+        assert!(ctx.succeeded());
+        assert!(ctx.model_usage["lead"].calls >= 2, "planning and advice are both the advisor's");
+    }
+
+    #[tokio::test]
+    async fn the_advisor_can_move_a_task_to_another_model_but_not_buy_it_more_attempts() {
+        let llm = ScriptedLlm::new(|kind, request, earlier| {
+            Ok(match kind {
+                Kind::Worker => signed(request),
+                Kind::Review => unmet_if(&request.prompt, "builds", "cargo build: error[E0425]"),
+                // First it sends the task up, then it names a model that does not exist.
+                Kind::Advice if earlier == 0 => r#"{"guidance": "rewrite the parser", "model": "strong"}"#.to_string(),
+                Kind::Advice => r#"{"guidance": "try again", "model": "imaginary"}"#.to_string(),
+                _ => agreeable(kind, request, earlier)?,
+            })
+        });
+        let (_dir, orchestrator, context) = setup(llm.clone(), true, 0);
+        {
+            let mut ctx = context.lock().await;
+            ctx.worker_models = vec!["cheap".into(), "middle".into(), "strong".into()];
+            ctx.advisor_model = Some("lead".into());
+        }
+
+        let end = tokio::time::timeout(Duration::from_secs(20), orchestrator.run(&context, Hitl::Stdin))
+            .await
+            .expect("the run must terminate")
+            .unwrap();
+        assert_eq!(end, RunEnd::Finished);
+        // Straight to the model the advisor chose, skipping the one in between; four attempts in all.
+        assert_eq!(worker_models(&llm), ["cheap", "strong", "strong", "strong"]);
+        // The advisor is not asked without limit, nor about an attempt that will not be repeated.
+        assert_eq!(llm.requests(Kind::Advice).len(), MAX_CONSULTS as usize);
+        let ctx = context.lock().await;
+        assert!(matches!(status_of(&ctx, "TASK-1"), TaskStatus::Failed { .. }));
+        assert_eq!(ctx.get_task("TASK-1").unwrap().consults, MAX_CONSULTS);
+    }
+
+    #[tokio::test]
+    async fn a_run_goes_on_when_the_advisor_gives_nothing_usable() {
+        let llm = ScriptedLlm::new(|kind, request, earlier| match kind {
+            Kind::Review if earlier == 0 => Ok(unmet_if(&request.prompt, "builds", "error[E0425]")),
+            Kind::Advice if earlier == 0 => Ok("I would look at the imports.".to_string()),
+            Kind::Advice => Err(LlmError::Other(anyhow!("HTTP 401 Unauthorized"))),
+            _ => agreeable(kind, request, earlier),
+        });
+        let (_dir, orchestrator, context) = setup(llm.clone(), true, 50);
+        context.lock().await.advisor_model = Some("lead".into());
+
+        assert_eq!(orchestrator.run(&context, Hitl::Stdin).await.unwrap(), RunEnd::Finished);
+        let ctx = context.lock().await;
+        assert_eq!(ctx.count_completed(), 2);
+        let retry = &llm.requests(Kind::Worker)[1];
+        assert!(retry.prompt.contains("error[E0425]") && !retry.prompt.contains("lead engineer"));
+    }
+
     /// Seen live: a correct review was overruled by the quote check four times.
     /// Nothing was wrong with the work, so the model that did it must not be
     /// marked down for it or have the task taken away.
@@ -1611,10 +1793,15 @@ mod tests {
             _ => agreeable(kind, request, earlier),
         });
         let (_dir, orchestrator, context) = setup(llm.clone(), true, 50);
-        context.lock().await.worker_models = vec!["cheap".into(), "strong".into()];
+        {
+            let mut ctx = context.lock().await;
+            ctx.worker_models = vec!["cheap".into(), "strong".into()];
+            ctx.advisor_model = Some("lead".into());
+        }
 
         assert_eq!(orchestrator.run(&context, Hitl::Stdin).await.unwrap(), RunEnd::Finished);
         assert_eq!(worker_models(&llm), ["cheap", "cheap", "cheap", "cheap", "cheap"]);
+        assert!(llm.requests(Kind::Advice).is_empty(), "there is no failure for the advisor to explain");
         let ctx = context.lock().await;
         assert_eq!(ctx.count_completed(), 2);
         assert_eq!((ctx.model_usage["cheap"].passed, ctx.model_usage["cheap"].rejected), (2, 0));

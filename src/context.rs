@@ -99,6 +99,13 @@ pub struct ProjectTask {
     /// Failed attempts since this task was last given a different model.
     #[serde(default)]
     pub failures_on_model: u32,
+    /// Set when an attempt failed and the advisor has not looked at it yet:
+    /// the model that made the attempt.
+    #[serde(default)]
+    pub advice_wanted_after: Option<String>,
+    /// How often the advisor has been consulted about this task.
+    #[serde(default)]
+    pub consults: u32,
 }
 
 impl ProjectTask {
@@ -117,6 +124,8 @@ impl ProjectTask {
             review_notes: Vec::new(),
             model: def.model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty()),
             failures_on_model: 0,
+            advice_wanted_after: None,
+            consults: 0,
         }
     }
 }
@@ -187,6 +196,10 @@ pub struct ModelUsage {
 /// After this many failed attempts on one model, a task moves to the next
 /// worker model, if there is one.
 pub const STEP_UP_AFTER: u32 = 2;
+
+/// How often the advisor is consulted about one task. Each consultation is a
+/// run of the most expensive model there is.
+pub const MAX_CONSULTS: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub enum RunPhase {
@@ -708,6 +721,8 @@ pub(crate) mod tests {
             review_notes: vec![],
             model: None,
             failures_on_model: 0,
+            advice_wanted_after: None,
+            consults: 0,
         }
     }
 

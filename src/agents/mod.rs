@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::context::{Finding, FindingStatus, ProjectTask, Requirement, TaskDef};
+use crate::context::{Finding, FindingStatus, MAX_RETRIES, ProjectTask, Requirement, TaskDef};
 use crate::llm::{AgentRequest, Llm, LlmError, LlmReply, TokenUsage};
 use crate::orchestrator::prompts;
 use crate::tools::{Sandbox, ToolAccess};
@@ -695,6 +695,88 @@ pub fn verdict_from(findings: &[Finding]) -> ReviewVerdict {
         } else {
             ReviewVerdict::Unproven(feedback)
         }
+    }
+}
+
+/// What the advisor made of a failed attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Advice {
+    /// Instructions for the worker's next attempt.
+    pub guidance: String,
+    /// The worker model the advisor wants for the next attempt, if it named one.
+    pub model: Option<String>,
+}
+
+pub fn parse_advice(reply: &str) -> Result<Advice, String> {
+    let value = extract_json(reply, '{', '}').ok_or("the reply did not contain a JSON object")?;
+    let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty());
+    let guidance = text("guidance").ok_or("the reply has no guidance")?;
+    let guidance = match text("diagnosis") {
+        Some(diagnosis) => format!("What went wrong: {diagnosis}\n\nWhat to do: {guidance}"),
+        None => guidance.to_string(),
+    };
+    Ok(Advice { guidance, model: text("model").map(str::to_string) })
+}
+
+/// A failed attempt, as put to the advisor.
+pub struct FailedAttempt<'a> {
+    pub task: &'a ProjectTask,
+    /// The model that made the attempt.
+    pub model: &'a str,
+    /// The model the next attempt is set to run on.
+    pub next_model: &'a str,
+    /// What is known about the worker models.
+    pub pool_facts: &'a str,
+}
+
+/// Ask the advisor why an attempt failed, what the worker should do, and on
+/// which model. It can look at the project but not change it.
+pub async fn advise(
+    llm: &dyn Llm,
+    advisor_model: &str,
+    attempt: &FailedAttempt<'_>,
+    settings: &AgentSettings,
+) -> AgentRun<Result<Advice, LlmError>> {
+    let task = attempt.task;
+    let mut prompt = format!(
+        "# Advice wanted\n\nA worker model attempted the task below and the attempt failed.\n\n\
+         # The task: {} ({})\n\n{}\n",
+        task.title, task.id, task.description
+    );
+    if !task.acceptance_criteria.is_empty() {
+        prompt.push_str(&format!("\n# Acceptance criteria\n\n{}", numbered(&task.acceptance_criteria)));
+    }
+    prompt.push_str(&format!(
+        "\n# What went wrong (failed attempt {} of at most {}, made by {})\n\n{}\n\
+         \n# Worker models\n\nListed from cheapest to most capable.\n\n{}\n\
+         The next attempt is set to run on {}.\n\n{}",
+        task.retries,
+        MAX_RETRIES + 1,
+        attempt.model,
+        task.feedback.as_deref().unwrap_or("(no details were recorded)"),
+        attempt.pool_facts,
+        attempt.next_model,
+        prompts::ADVICE_INSTRUCTIONS
+    ));
+
+    tracing::info!("Advisor [{}]: looking at the failed attempt by {}, on {advisor_model}", task.id, attempt.model);
+    let request = AgentRequest {
+        model: advisor_model.to_string(),
+        preamble: format!("{}{}", prompts::ADVISOR_SYSTEM_PROMPT, design_section(&settings.design_doc)),
+        prompt,
+        tools: ToolAccess::Inspect,
+        sandbox: settings.sandbox.clone(),
+        max_turns: REVIEW_MAX_TURNS,
+    };
+    match run_with_backoff(llm, request, settings.retry_delay).await {
+        Ok(reply) => AgentRun {
+            outcome: parse_advice(&reply.text)
+                .map_err(|e| LlmError::Other(anyhow::anyhow!("the advisor's answer was unusable: {e}"))),
+            usage: reply.usage,
+            calls: 1,
+            reply: Some(reply.text),
+        },
+        Err(e) => AgentRun { outcome: Err(e), usage: TokenUsage::default(), calls: 0, reply: None },
     }
 }
 
