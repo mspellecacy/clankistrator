@@ -27,7 +27,11 @@ use crate::orchestrator::{Hitl, Orchestrator, PROVIDER_RETRY_DELAY, RunEnd, Shar
 use crate::tools::Sandbox;
 use crate::tui::App;
 
-const FALLBACK_MODEL: &str = "gpt-4o";
+/// Used when neither --model nor $DEFAULT_MODEL names a model. A model name
+/// in source code goes stale (this was `gpt-4o` until OpenAI scheduled it for
+/// shutdown), so the startup request to the model is what really decides
+/// whether it can be used.
+const FALLBACK_MODEL: &str = "gpt-6.1-sol";
 const DEFAULT_MAX_STEPS: usize = 50;
 const DEFAULT_MAX_TURNS: usize = 40;
 
@@ -43,7 +47,7 @@ struct Args {
     output: PathBuf,
 
     /// Model, optionally with a provider prefix (openai:, anthropic:, gemini:, ollama:).
-    /// Defaults to $DEFAULT_MODEL, then gpt-4o
+    /// Defaults to $DEFAULT_MODEL, then gpt-6.1-sol
     #[arg(short, long)]
     model: Option<String>,
 

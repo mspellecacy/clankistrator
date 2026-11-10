@@ -69,7 +69,7 @@ The summary reports input tokens as one total, with the part read from the cache
 | --- | --- | --- |
 | `-d, --design <FILE>` | `design.md` | Markdown design document |
 | `-o, --output <DIR>` | `$WORKING_DIRECTORY`, else `output` | Directory the agents work in |
-| `-m, --model <MODEL>` | `$DEFAULT_MODEL`, else `gpt-4o` | Model, see below |
+| `-m, --model <MODEL>` | `$DEFAULT_MODEL`, else `gpt-6.1-sol` | Model, see below |
 | `--headless` | off | Log output instead of the TUI; approvals on stdin |
 | `-b, --brave` | off | Approve reviewed tasks automatically |
 | `-S, --max-steps <N>` | 50 | Orchestration passes that ran or reviewed a task; 0 is unlimited. Waiting for approval costs nothing |
@@ -105,7 +105,9 @@ A model is named as `prefix:model`. For three providers the prefix can be left o
 
 "Run live" says whether that path has been exercised against the real service by the maintainers. The rows marked "no" compile and are wired up the same way, but nobody has seen them work; probe before you trust them. "Probe only" means a request and a tool call went through, and no full run has been made.
 
-Examples: `--model gpt-4o`, `--model ollama:qwen2.5-coder:14b`, `--model openrouter:vendor/model-name`, `--model compatible:whatever-your-server-calls-it`. OpenRouter and OpenAI-compatible servers are how to reach providers that have no row of their own.
+Examples: `--model gpt-6.1-sol`, `--model ollama:qwen2.5-coder:14b`, `--model openrouter:vendor/model-name`, `--model compatible:whatever-your-server-calls-it`. OpenRouter and OpenAI-compatible servers are how to reach providers that have no row of their own.
+
+Model names go out of date. Providers retire models on a schedule (OpenAI shuts down the `gpt-4o` snapshots on 2027-01-14, for instance), and a name that works today may be a provider's oldest and weakest offering. Check the provider's model list when choosing, and probe: every run starts with a request to each model it will use, so a retired name stops the run at once rather than failing halfway.
 
 Workers and reviewers can use different models, from different providers: `--model` builds, `--review-model` judges. A cheaper model that builds with a stronger one that reviews is a reasonable combination.
 
@@ -116,7 +118,7 @@ One strong model can lead a run while cheaper ones do the building:
 ```bash
 cargo run --release -- --design design.md --output ../my-project \
   --advisor-model claude-sonnet-5-5 \
-  --workers openrouter:cohere/north-mini-code:free,gpt-4o,claude-sonnet-5-5
+  --workers openrouter:cohere/north-mini-code:free,gpt-6-luna,claude-sonnet-5-5
 ```
 
 `--workers` lists the models that may build, **cheapest first**. Only the models you name are used; having a key for a provider does not put its models in the pool. `--advisor-model` is the lead. It never writes the project's files. What each part does:
@@ -137,7 +139,7 @@ Run live so far: planning and assignment (through the MCP `plan_tasks` tool). St
 #### Checking that a model works
 
 ```bash
-cargo run --release -- --probe gpt-4o claude-sonnet-5-5 ollama:llama3.2
+cargo run --release -- --probe gpt-6.1-sol claude-sonnet-5-5 ollama:llama3.2
 ```
 
 For each model, `--probe` makes one plain request and then one tool call, in which the model has to call a tool with a list argument and repeat a code that only the tool knows. It uses no files and runs no commands, and costs a few hundred tokens per model. A model that fails the tool call cannot be used, because workers and reviewers do everything through tools. The exit code is 0 only if every model passed.

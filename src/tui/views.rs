@@ -122,7 +122,7 @@ fn draw_config_modal(frame: &mut Frame, app: &App, ctx: &ProjectContext) {
 fn draw_input(frame: &mut Frame, input: &Input) {
     let (title, text) = match input {
         Input::Reject { task_id, text } => (format!(" Why is {task_id} rejected? (Enter to send, Esc to cancel) "), text),
-        Input::Model { text } => (" Model, e.g. gpt-4o or ollama:llama3.2 (Enter to apply, Esc to cancel) ".to_string(), text),
+        Input::Model { text } => (" Model, e.g. gpt-6.1-sol or ollama:llama3.2 (Enter to apply, Esc to cancel) ".to_string(), text),
     };
     let area = centered_rect(70, 20, frame.area());
     // A fixed-height box, kept inside the screen however small the terminal is.
