@@ -53,6 +53,8 @@ pub struct IterationReport {
     pub executed: usize,
     pub reviewed: usize,
     pub auto_approved: usize,
+    /// Tasks failed without an attempt, because no worker model is left.
+    pub given_up: usize,
 }
 
 pub struct Orchestrator {
@@ -370,12 +372,7 @@ fn apply_advice(ctx: &mut ProjectContext, task_id: &str, next_model: &str, advic
     let chosen = advice.model.filter(|model| model != next_model);
     let usable = chosen.as_ref().is_some_and(|model| ctx.usable_pool().contains(&model.as_str()));
     let Some(t) = ctx.get_task_mut(task_id) else { return };
-    let earlier = t.feedback.take().unwrap_or_default();
-    t.feedback = Some(format!(
-        "{earlier}\n\n# Advice from the lead engineer\n\n\
-         The lead engineer looked at the project after that attempt failed. Follow this advice:\n\n{}",
-        advice.guidance
-    ));
+    t.advice = Some(advice.guidance);
     match chosen {
         Some(model) if usable => {
             tracing::warn!("Orchestrator [{task_id}]: the advisor moved the task from {next_model} to {model}");
@@ -492,8 +489,11 @@ fn apply_review(
     summary: String,
     verdict: Result<ReviewVerdict, crate::llm::LlmError>,
 ) {
-    // The model whose work is being judged.
-    let Some(model) = ctx.get_task(task_id).map(|t| ctx.worker_model_for(t)) else { return };
+    // The model whose work is being judged: the one the attempt was dispatched to.
+    let Some(model) = ctx.get_task(task_id).map(|t| t.attempt_model.clone().unwrap_or_else(|| ctx.model.clone()))
+    else {
+        return;
+    };
     match &verdict {
         Ok(ReviewVerdict::Passed { .. }) => ctx.model_usage.entry(model.clone()).or_default().passed += 1,
         Ok(ReviewVerdict::Rejected(_)) => {
@@ -537,6 +537,7 @@ fn apply_review(
             t.feedback = None;
             t.retries = 0;
             t.failures_on_model = 0;
+            t.advice = None;
             t.review_notes = notes;
         }
         Ok(ReviewVerdict::Rejected(feedback)) => {
@@ -679,7 +680,7 @@ impl Orchestrator {
                 save(&ctx);
                 continue;
             }
-            if report.auto_approved > 0 {
+            if report.auto_approved + report.given_up > 0 {
                 save(&*context.lock().await);
                 continue;
             }
@@ -783,7 +784,7 @@ impl Orchestrator {
                         acceptance_criteria: unmet.iter().map(|f| f.requirement.clone()).collect(),
                         // These are what the earlier work missed, so they go to the
                         // strongest worker model there is.
-                        model: (ctx.pool().len() > 1).then(|| ctx.strongest_model()),
+                        model: if ctx.pool().len() > 1 { ctx.strongest_model() } else { None },
                     };
                     ctx.tasks.push(ProjectTask::new(id, def));
                 } else {
@@ -809,12 +810,27 @@ impl Orchestrator {
             report.auto_approved += auto_approve(&mut ctx);
             let settings = self.settings(&ctx);
             let prior_work = describe_prior_work(&ctx);
-            let ready: Vec<(ProjectTask, String)> = ctx
+            let candidates: Vec<(ProjectTask, Option<String>)> = ctx
                 .get_ready_tasks()
                 .into_iter()
                 .map(|task| (task.clone(), ctx.worker_model_for(task)))
                 .collect();
-            for (task, model) in &ready {
+            let mut ready: Vec<(ProjectTask, String)> = Vec::new();
+            for (task, model) in candidates {
+                let Some(model) = model else {
+                    // Every worker model has dropped out. The run does not reach for a
+                    // model that was not offered as a worker.
+                    let reasons: Vec<String> =
+                        ctx.retired_models.iter().map(|(model, why)| format!("{model}: {why}")).collect();
+                    tracing::error!("Orchestrator [{}]: no worker model can be used any more", task.id);
+                    if let Some(t) = ctx.get_task_mut(&task.id) {
+                        t.status = TaskStatus::Failed {
+                            error: format!("No worker model can be used any more. {}", reasons.join("; ")),
+                        };
+                    }
+                    report.given_up += 1;
+                    continue;
+                };
                 tracing::info!(
                     "Orchestrator [{}]: dispatching to {:?} worker on {model}",
                     task.id,
@@ -822,7 +838,9 @@ impl Orchestrator {
                 );
                 if let Some(t) = ctx.get_task_mut(&task.id) {
                     t.status = TaskStatus::InProgress;
+                    t.attempt_model = Some(model.clone());
                 }
+                ready.push((task, model));
             }
             (settings, ready, prior_work)
         };
@@ -914,8 +932,9 @@ impl Orchestrator {
                 if advisor.is_none() || ctx.tasks[index].status != TaskStatus::Pending {
                     continue;
                 }
+                // With no worker model left there will be no next attempt to advise.
+                let Some(next) = ctx.worker_model_for(&ctx.tasks[index]) else { continue };
                 ctx.tasks[index].consults += 1;
-                let next = ctx.worker_model_for(&ctx.tasks[index]);
                 to_advise.push((ctx.tasks[index].clone(), failed_on, next));
             }
             (advisor, to_advise, describe_pool(&ctx))
@@ -1526,7 +1545,7 @@ mod tests {
     #[tokio::test]
     async fn an_authentication_error_is_not_retried_at_the_call_level() {
         let llm = ScriptedLlm::new(|kind, request, earlier| match kind {
-            Kind::Worker => Err(LlmError::Other(anyhow!("HTTP 401 Unauthorized"))),
+            Kind::Worker => Err(LlmError::Other(anyhow!("HttpError: Invalid status code 401 Unauthorized"))),
             _ => agreeable(kind, request, earlier),
         });
         let (_dir, orchestrator, context) = setup(llm.clone(), true, 50);
@@ -1705,6 +1724,7 @@ mod tests {
         assert!(advice[0].prompt.contains("failed attempt 1 of at most 4, made by cheap"));
         assert!(advice[0].prompt.contains("- cheap: paid; so far in this run 0 of its task attempts passed review and 1 failed"));
         assert!(advice[0].prompt.contains("The next attempt is set to run on cheap."));
+        assert!(!advice[0].prompt.contains("Advice you gave after an earlier failed attempt"));
 
         let workers = llm.requests(Kind::Worker);
         assert_eq!(worker_models(&llm), ["cheap", "cheap", "cheap"], "the advisor left the model alone");
@@ -1747,7 +1767,15 @@ mod tests {
         // Straight to the model the advisor chose, skipping the one in between; four attempts in all.
         assert_eq!(worker_models(&llm), ["cheap", "strong", "strong", "strong"]);
         // The advisor is not asked without limit, nor about an attempt that will not be repeated.
-        assert_eq!(llm.requests(Kind::Advice).len(), MAX_CONSULTS as usize);
+        let consults = llm.requests(Kind::Advice);
+        assert_eq!(consults.len(), MAX_CONSULTS as usize);
+        // Asked a second time, it is shown what it said the first time.
+        assert!(consults[1].prompt.contains("# Advice you gave after an earlier failed attempt"));
+        assert!(consults[1].prompt.contains("rewrite the parser"));
+        // Its latest advice stays in front of the worker after the consultations are used up.
+        let workers = llm.requests(Kind::Worker);
+        assert!(workers[1].prompt.contains("rewrite the parser"));
+        assert!(workers[3].prompt.contains("try again") && !workers[3].prompt.contains("rewrite the parser"));
         let ctx = context.lock().await;
         assert!(matches!(status_of(&ctx, "TASK-1"), TaskStatus::Failed { .. }));
         assert_eq!(ctx.get_task("TASK-1").unwrap().consults, MAX_CONSULTS);
@@ -1769,6 +1797,63 @@ mod tests {
         assert_eq!(ctx.count_completed(), 2);
         let retry = &llm.requests(Kind::Worker)[1];
         assert!(retry.prompt.contains("error[E0425]") && !retry.prompt.contains("lead engineer"));
+    }
+
+    const INDEPENDENT_PLAN: &str = r#"[
+        {"id":"TASK-1","title":"One","description":"First","dependencies":[],"assigned_role":"Backend",
+         "acceptance_criteria":["Cargo.toml exists in the project root"]},
+        {"id":"TASK-2","title":"Two","description":"Second","dependencies":[],"assigned_role":"Backend",
+         "acceptance_criteria":["`sum(&[])` returns Ok(0.0)"]},
+        {"id":"TASK-3","title":"Three","description":"Third","dependencies":["TASK-1"],"assigned_role":"Backend",
+         "acceptance_criteria":["README.md exists"]}
+    ]"#;
+
+    /// `--model paid --workers free`: the paid model plans and reviews. When the
+    /// free allowance runs out, building stops; it does not move to the paid
+    /// model, which was never offered as a worker.
+    #[tokio::test]
+    async fn when_every_worker_model_has_dropped_out_nothing_else_is_used_to_build() {
+        let llm = ScriptedLlm::new(|kind, request, earlier| match kind {
+            Kind::Plan => Ok(INDEPENDENT_PLAN.to_string()),
+            Kind::Worker => Err(LlmError::Other(anyhow!("ProviderError: {}", crate::llm::FREE_ALLOWANCE_USED_UP))),
+            _ => agreeable(kind, request, earlier),
+        });
+        let (_dir, orchestrator, context) = setup(llm.clone(), true, 0);
+        context.lock().await.worker_models = vec!["free".into()];
+
+        let end = tokio::time::timeout(Duration::from_secs(20), orchestrator.run(&context, Hitl::Stdin))
+            .await
+            .expect("the run must terminate")
+            .unwrap();
+        assert_eq!(end, RunEnd::Finished);
+        let workers = llm.requests(Kind::Worker);
+        assert!(!workers.is_empty() && workers.iter().all(|r| r.model == "free"), "{:?}", worker_models(&llm));
+        assert!(workers.len() <= 2, "only the tasks already under way found out the hard way");
+        let ctx = context.lock().await;
+        assert_eq!(ctx.count_failed(), 3);
+        assert!(matches!(status_of(&ctx, "TASK-3"), TaskStatus::Failed { .. }));
+    }
+
+    /// A rate limit is not a reason to drop a model, even when its text
+    /// contains the digits of an authentication error.
+    #[tokio::test]
+    async fn a_rate_limited_model_stays_in_the_pool() {
+        let llm = ScriptedLlm::new(|kind, request, earlier| match kind {
+            // Two refusals are absorbed by the call-level retries of one attempt.
+            Kind::Worker if earlier < 2 => Err(LlmError::Other(anyhow!(
+                "HttpError: Invalid status code 429 Too Many Requests with message: Requested 40312 tokens"
+            ))),
+            _ => agreeable(kind, request, earlier),
+        });
+        let (_dir, orchestrator, context) = setup(llm.clone(), true, 50);
+        context.lock().await.worker_models = vec!["cheap".into(), "strong".into()];
+
+        assert_eq!(orchestrator.run(&context, Hitl::Stdin).await.unwrap(), RunEnd::Finished);
+        let ctx = context.lock().await;
+        assert!(ctx.retired_models.is_empty());
+        assert_eq!(ctx.count_completed(), 2);
+        assert!(ctx.tasks.iter().all(|t| t.retries == 0));
+        assert!(worker_models(&llm).iter().all(|model| model == "cheap"), "{:?}", worker_models(&llm));
     }
 
     /// Seen live: a correct review was overruled by the quote check four times.

@@ -106,6 +106,13 @@ pub struct ProjectTask {
     /// How often the advisor has been consulted about this task.
     #[serde(default)]
     pub consults: u32,
+    /// The advisor's latest guidance for this task, shown to the worker on
+    /// every further attempt and to the advisor if it is consulted again.
+    #[serde(default)]
+    pub advice: Option<String>,
+    /// The model that made, or is making, the latest attempt.
+    #[serde(default)]
+    pub attempt_model: Option<String>,
 }
 
 impl ProjectTask {
@@ -126,6 +133,8 @@ impl ProjectTask {
             failures_on_model: 0,
             advice_wanted_after: None,
             consults: 0,
+            advice: None,
+            attempt_model: None,
         }
     }
 }
@@ -388,12 +397,15 @@ impl ProjectContext {
     }
 
     /// The model a task's next attempt runs on: the one chosen for it if that
-    /// is still usable, otherwise the first usable worker model.
-    pub fn worker_model_for(&self, task: &ProjectTask) -> String {
+    /// is still usable, otherwise the first usable worker model. `None` when
+    /// no worker model is usable any more. There is no falling back to a model
+    /// that was not named as a worker: that would spend on something the user
+    /// did not offer.
+    pub fn worker_model_for(&self, task: &ProjectTask) -> Option<String> {
         let usable = self.usable_pool();
         match &task.model {
-            Some(model) if usable.contains(&model.as_str()) => model.clone(),
-            _ => usable.first().copied().unwrap_or(&self.model).to_string(),
+            Some(model) if usable.contains(&model.as_str()) => Some(model.clone()),
+            _ => usable.first().map(|model| model.to_string()),
         }
     }
 
@@ -405,8 +417,8 @@ impl ProjectContext {
     }
 
     /// The strongest usable worker model: the last one in the pool's order.
-    pub fn strongest_model(&self) -> String {
-        self.usable_pool().last().copied().unwrap_or(&self.model).to_string()
+    pub fn strongest_model(&self) -> Option<String> {
+        self.usable_pool().last().map(|model| model.to_string())
     }
 
     /// Whether the finished project still has to be checked against the design.
@@ -623,7 +635,12 @@ impl ProjectContext {
                         t.feedback = Some(format!("An earlier run gave up on this task: {error}"));
                     }
                     t.status = TaskStatus::Pending;
+                    // A resumed task starts over in every respect: attempts,
+                    // its place in the pool, and the advisor's attention.
                     t.retries = 0;
+                    t.failures_on_model = 0;
+                    t.consults = 0;
+                    t.advice_wanted_after = None;
                 }
                 _ => {}
             }
@@ -723,6 +740,8 @@ pub(crate) mod tests {
             failures_on_model: 0,
             advice_wanted_after: None,
             consults: 0,
+            advice: None,
+            attempt_model: None,
         }
     }
 
@@ -820,6 +839,8 @@ pub(crate) mod tests {
         ctx.get_task_mut("B").unwrap().status = TaskStatus::InProgress;
         ctx.get_task_mut("C").unwrap().status = TaskStatus::Failed { error: "nope".into() };
         ctx.get_task_mut("C").unwrap().retries = 4;
+        ctx.get_task_mut("C").unwrap().failures_on_model = 2;
+        ctx.get_task_mut("C").unwrap().consults = MAX_CONSULTS;
         ctx.fail_blocked();
         ctx.steps_taken = 7;
         ctx.input_tokens = 123;
@@ -834,7 +855,7 @@ pub(crate) mod tests {
         assert_eq!(loaded.get_task("B").unwrap().status, TaskStatus::Pending);
         let c = loaded.get_task("C").unwrap();
         assert_eq!(c.status, TaskStatus::Pending);
-        assert_eq!(c.retries, 0);
+        assert_eq!((c.retries, c.failures_on_model, c.consults), (0, 0, 0));
         assert!(c.feedback.as_deref().unwrap().contains("nope"));
         let d = loaded.get_task("D").unwrap();
         assert_eq!(d.status, TaskStatus::Pending);

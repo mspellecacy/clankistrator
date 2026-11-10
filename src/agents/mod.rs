@@ -42,27 +42,28 @@ pub struct AgentSettings {
     pub retry_delay: Duration,
 }
 
-/// Errors that will not go away by waiting.
+/// Errors that will not go away by waiting. When the provider sent a status,
+/// the status decides; words are only consulted when there is none, and
+/// numbers never are: "Requested 40312 tokens" is not a 403.
 fn is_permanent(error: &str) -> bool {
+    if let Some(status) = crate::llm::http_status(error) {
+        return matches!(status, 400..=404 | 422);
+    }
     let lower = error.to_ascii_lowercase();
     [
-        "401",
-        "403",
         "unauthorized",
         "invalid_api_key",
         "invalid api key",
         "authentication",
-        "permission",
         "is not set",
         // Out of credit, out of the day's free allowance, or a model the
         // settings forbid: waiting seconds does not help.
-        "status code 402",
         "payment required",
         "allowance for today is used up",
         "is not a free openrouter model",
     ]
-        .iter()
-        .any(|marker| lower.contains(marker))
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 /// Run an agent, waiting and trying again when the provider call fails (rate
@@ -521,6 +522,13 @@ pub async fn execute_task(
              Your earlier files are still in the project directory. Fix the problems described above.\n"
         ));
     }
+    if let Some(advice) = &task.advice {
+        prompt.push_str(&format!(
+            "\n# Advice from the lead engineer\n\n\
+             The lead engineer looked at the project after an attempt at this task failed. Follow this advice:\n\n\
+             {advice}\n"
+        ));
+    }
     prompt.push_str(prompts::WORKER_REPORT_FORMAT);
 
     tracing::info!("Worker ({:?}) [{}]: starting", task.assigned_role, task.id);
@@ -551,7 +559,7 @@ pub async fn execute_task(
             calls: 0,
             reply: None,
         },
-        Err(e) if is_permanent(&e.to_string()) => AgentRun {
+        Err(e) if crate::llm::model_unusable(&e.to_string()) => AgentRun {
             outcome: WorkerOutcome::ModelUnavailable { reason: e.to_string() },
             usage: TokenUsage::default(),
             calls: 0,
@@ -745,6 +753,12 @@ pub async fn advise(
     );
     if !task.acceptance_criteria.is_empty() {
         prompt.push_str(&format!("\n# Acceptance criteria\n\n{}", numbered(&task.acceptance_criteria)));
+    }
+    if let Some(earlier) = &task.advice {
+        prompt.push_str(&format!(
+            "\n# Advice you gave after an earlier failed attempt\n\n\
+             The worker had this in front of it for the attempt that has now failed.\n\n{earlier}\n"
+        ));
     }
     prompt.push_str(&format!(
         "\n# What went wrong (failed attempt {} of at most {}, made by {})\n\n{}\n\
@@ -1194,6 +1208,10 @@ mod tests {
         assert!(!crate::llm::is_transient(crate::llm::FREE_ALLOWANCE_USED_UP));
         assert!(is_permanent("Invalid status code 402 Payment Required"));
         assert!(!is_permanent("HTTP 429 Too Many Requests: rate limit reached"));
+        assert!(is_permanent("HttpError: Invalid status code 403 Forbidden"));
+        // Seen in a test of this very thing: digits inside a rate-limit message.
+        assert!(!is_permanent("HttpError: Invalid status code 429 Too Many Requests with message: Requested 40312 tokens"));
+        assert!(!is_permanent("ProviderError: limit of 4010 requests reached, retry shortly"));
         assert!(!is_permanent("503 service unavailable"));
         assert!(!is_permanent("connection reset by peer"));
     }

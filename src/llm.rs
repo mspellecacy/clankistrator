@@ -88,6 +88,28 @@ pub fn uses_free_tier(model_specs: &[&str]) -> bool {
     })
 }
 
+/// The HTTP status in an error from a provider, if it carries one.
+pub fn http_status(error: &str) -> Option<u16> {
+    let lower = error.to_ascii_lowercase();
+    lower
+        .split_once("status code ")
+        .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse::<u16>().ok())
+}
+
+/// Does this error mean the model cannot be used at all for now, whatever is
+/// asked of it? A worker model is dropped from a run on the strength of this,
+/// so it goes by the status the provider sent or by this program's own
+/// messages, never by a word that happens to occur in an error text.
+pub fn model_unusable(error: &str) -> bool {
+    if let Some(status) = http_status(error) {
+        return matches!(status, 401..=404);
+    }
+    [FREE_ALLOWANCE_USED_UP, "is not a free OpenRouter model", "is not set", "could not create the"]
+        .iter()
+        .any(|own| error.contains(own))
+}
+
 /// Would sending the same request again later plausibly work?
 ///
 /// Deliberately a list of what is known to pass rather than "anything but a
@@ -95,11 +117,7 @@ pub fn uses_free_tier(model_specs: &[&str]) -> bool {
 /// spends time and allowance.
 pub fn is_transient(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
-    let status = lower
-        .split_once("status code ")
-        .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
-        .and_then(|digits| digits.parse::<u16>().ok());
-    if let Some(status) = status {
+    if let Some(status) = http_status(error) {
         return matches!(status, 408 | 425 | 429) || status >= 500;
     }
     [
@@ -823,6 +841,22 @@ mod tests {
             "free_model_daily_requests": {"used": 9, "limit": 50, "remaining": 41}}});
         assert_eq!(parse_free_allowance(&body), Some(FreeAllowance { limit: 50, remaining: 41 }));
         assert_eq!(parse_free_allowance(&serde_json::json!({"error": {"code": 401}})), None);
+    }
+
+    #[test]
+    fn a_model_is_only_given_up_on_for_a_reason_that_is_certain() {
+        assert!(model_unusable("HttpError: Invalid status code 401 Unauthorized"));
+        assert!(model_unusable("HttpError: Invalid status code 402 Payment Required"));
+        assert!(model_unusable("HttpError: Invalid status code 404 Not Found with message: no such model"));
+        assert!(model_unusable(&CompletionError::ProviderError(FREE_ALLOWANCE_USED_UP.to_string()).to_string()));
+        assert!(model_unusable("OPENROUTER_API_KEY is not set (or still holds the placeholder from .env.example)."));
+        // A rate limit whose text happens to contain the digits of an auth error.
+        assert!(!model_unusable(
+            "HttpError: Invalid status code 429 Too Many Requests with message: Requested 40312 tokens, limit 40100"
+        ));
+        assert!(!model_unusable("ProviderError: you do not have permission to exceed 4030 requests per minute"));
+        assert!(!model_unusable("HttpError: Invalid status code 503 Service Unavailable"));
+        assert!(!model_unusable("HttpError: error sending request for url"));
     }
 
     #[test]
