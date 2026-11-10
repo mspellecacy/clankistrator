@@ -3,6 +3,7 @@
 //! Everything else goes through the [`Llm`] trait, which keeps the orchestration
 //! logic testable with scripted replies.
 
+use std::fmt::Display;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -12,8 +13,10 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use rig::agent::{AgentBuilder, HookAction, PromptHook};
 use rig::client::{CompletionClient, Nothing};
-use rig::completion::{Prompt, PromptError};
+use rig::completion::{CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Prompt, PromptError};
 use rig::providers::{anthropic, gemini, ollama, openai, openrouter};
+use rig::streaming::StreamingCompletionResponse;
+use tokio::time::Instant;
 
 use crate::tools::{Sandbox, ToolAccess};
 
@@ -24,6 +27,171 @@ const AGENT_RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// rig only knows output limits for older Claude models and refuses to send a
 /// request without one, so newer models get this value.
 const ANTHROPIC_FALLBACK_MAX_TOKENS: u64 = 16_000;
+
+/// How long to wait before sending a request again after the provider turned
+/// it away for a reason that passes (rate limit, overload, a dropped
+/// connection). The last wait is long enough for a per-minute limit to reset.
+const REQUEST_RETRY_DELAYS: [Duration; 3] =
+    [Duration::from_secs(5), Duration::from_secs(20), Duration::from_secs(65)];
+
+/// OpenRouter allows 20 requests a minute to its free models, across the
+/// whole account. Spacing requests this far apart stays just under that.
+const FREE_MODEL_REQUEST_INTERVAL: Duration = Duration::from_millis(3_200);
+
+/// Set to a true value to refuse OpenRouter models that cost money.
+pub const OPENROUTER_FREE_ONLY_VAR: &str = "OPENROUTER_FREE_ONLY";
+
+static FREE_MODEL_PACER: Pacer = Pacer::new(FREE_MODEL_REQUEST_INTERVAL);
+
+/// Hands out send times at a fixed spacing, to every agent in the process,
+/// and counts the requests it let through.
+struct Pacer {
+    interval: Duration,
+    next: std::sync::Mutex<Option<Instant>>,
+    sent: AtomicU64,
+}
+
+impl Pacer {
+    const fn new(interval: Duration) -> Self {
+        Self { interval, next: std::sync::Mutex::new(None), sent: AtomicU64::new(0) }
+    }
+
+    /// Wait for this caller's turn. Turns are reserved in arrival order.
+    async fn wait(&self) {
+        let turn = {
+            let mut next = self.next.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = Instant::now();
+            let turn = next.map_or(now, |at| at.max(now));
+            *next = Some(turn + self.interval);
+            turn
+        };
+        tokio::time::sleep_until(turn).await;
+        self.sent.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Requests sent to OpenRouter's free models by this process, including
+/// failed ones: the free tier's daily allowance counts requests, not tokens.
+pub fn free_model_requests() -> u64 {
+    FREE_MODEL_PACER.sent.load(Ordering::Relaxed)
+}
+
+/// OpenRouter marks the variants it does not charge for with this suffix.
+pub fn is_free_openrouter_model(model: &str) -> bool {
+    model.trim().ends_with(":free")
+}
+
+/// Is any of these model specs an OpenRouter free model?
+pub fn uses_free_tier(model_specs: &[&str]) -> bool {
+    model_specs.iter().any(|spec| {
+        let (provider, model) = resolve_model(spec);
+        provider == Provider::OpenRouter && is_free_openrouter_model(model)
+    })
+}
+
+/// Would sending the same request again later plausibly work?
+///
+/// Deliberately a list of what is known to pass rather than "anything but a
+/// bad key": a request that is wrong stays wrong, and resending it only
+/// spends time and allowance.
+pub fn is_transient(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    // A daily allowance does not come back by waiting a minute.
+    if lower.contains("per-day") || lower.contains("per day") {
+        return false;
+    }
+    let status = lower
+        .split_once("status code ")
+        .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse::<u16>().ok());
+    if let Some(status) = status {
+        return matches!(status, 408 | 425 | 429) || status >= 500;
+    }
+    [
+        "429",
+        "too many requests",
+        "rate limit",
+        "rate-limit",
+        "overloaded",
+        "temporarily",
+        "timed out",
+        "timeout",
+        "connection",
+        "error sending request",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Make one request, waiting for the pacer first and trying again after a
+/// passing failure.
+async fn send_with_retries<T, E, F, Fut>(pacer: Option<&Pacer>, delays: &[Duration], mut send: F) -> Result<T, E>
+where
+    E: Display,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    let mut delays = delays.iter();
+    loop {
+        if let Some(pacer) = pacer {
+            pacer.wait().await;
+        }
+        match send().await {
+            Err(e) if is_transient(&e.to_string()) => match delays.next() {
+                Some(delay) => {
+                    tracing::warn!("Model request failed, sending it again in {}s: {e}", delay.as_secs());
+                    tokio::time::sleep(*delay).await;
+                }
+                None => return Err(e),
+            },
+            other => return other,
+        }
+    }
+}
+
+/// A provider's model, made patient: a request that is turned away for a
+/// passing reason is sent again instead of ending the agent, which would throw
+/// away every turn the agent had already made (and paid for).
+#[derive(Clone)]
+struct Steady<M> {
+    inner: M,
+    pacer: Option<&'static Pacer>,
+}
+
+impl<M> Steady<M> {
+    fn new(inner: M) -> Self {
+        Self { inner, pacer: None }
+    }
+
+    fn paced(inner: M, pacer: &'static Pacer) -> Self {
+        Self { inner, pacer: Some(pacer) }
+    }
+}
+
+impl<M: CompletionModel> CompletionModel for Steady<M> {
+    type Response = M::Response;
+    type StreamingResponse = M::StreamingResponse;
+    type Client = M::Client;
+
+    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
+        Self::new(M::make(client, model))
+    }
+
+    fn completion(
+        &self,
+        request: CompletionRequest,
+    ) -> impl Future<Output = Result<CompletionResponse<Self::Response>, CompletionError>> + Send {
+        send_with_retries(self.pacer, &REQUEST_RETRY_DELAYS, move || self.inner.completion(request.clone()))
+    }
+
+    fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> impl Future<Output = Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError>> + Send
+    {
+        self.inner.stream(request)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentRequest {
@@ -135,16 +303,26 @@ impl Provider {
         }
     }
 
-    /// The environment variable holding this provider's API key, if it must have one.
-    pub fn key_var(self) -> Option<&'static str> {
+    /// The environment variables that may hold this provider's API key, the
+    /// documented name first. Empty if the provider does not require a key.
+    pub fn key_vars(self) -> &'static [&'static str] {
         match self {
-            Provider::OpenAi => Some("OPENAI_API_KEY"),
-            Provider::Anthropic => Some("ANTHROPIC_API_KEY"),
-            Provider::Gemini => Some("GEMINI_API_KEY"),
-            Provider::OpenRouter => Some("OPENROUTER_API_KEY"),
-            Provider::Ollama | Provider::OpenAiCompatible => None,
+            Provider::OpenAi => &["OPENAI_API_KEY"],
+            Provider::Anthropic => &["ANTHROPIC_API_KEY"],
+            Provider::Gemini => &["GEMINI_API_KEY"],
+            Provider::OpenRouter => &["OPENROUTER_API_KEY", "OPENROUTER_KEY"],
+            Provider::Ollama | Provider::OpenAiCompatible => &[],
         }
     }
+}
+
+/// Every environment variable that can hold a provider credential. Commands
+/// run by agents must not see any of them: their output goes back to a model.
+pub fn secret_env_vars() -> Vec<&'static str> {
+    let mut vars: Vec<&'static str> =
+        Provider::ALL.iter().flat_map(|provider| provider.key_vars().iter().copied()).collect();
+    vars.push(COMPATIBLE_KEY_VAR);
+    vars
 }
 
 /// Split a model spec into provider and model name.
@@ -186,12 +364,14 @@ fn looks_like_placeholder(key: &str) -> bool {
 }
 
 fn api_key(provider: Provider) -> Result<String> {
-    let Some(var) = provider.key_var() else {
+    let vars = provider.key_vars();
+    let Some(var) = vars.first() else {
         return Ok(String::new());
     };
-    match std::env::var(var) {
-        Ok(key) if !looks_like_placeholder(&key) => Ok(key),
-        _ => bail!(
+    let found = vars.iter().filter_map(|var| std::env::var(var).ok()).find(|key| !looks_like_placeholder(key));
+    match found {
+        Some(key) => Ok(key.trim().to_string()),
+        None => bail!(
             "{var} is not set (or still holds the placeholder from .env.example). \
              Put a real key in .env or .env.local, or pick a model from another provider with --model."
         ),
@@ -210,7 +390,18 @@ pub fn check_credentials(model_spec: &str) -> Result<()> {
              OpenAI-compatible server, for example http://localhost:1234/v1."
         );
     }
+    if provider == Provider::OpenRouter && free_only() && !is_free_openrouter_model(model) {
+        bail!(
+            "{model} is not a free OpenRouter model, and {OPENROUTER_FREE_ONLY_VAR} is set. \
+             Free models have names ending in :free."
+        );
+    }
     api_key(provider).map(|_| ())
+}
+
+fn free_only() -> bool {
+    std::env::var(OPENROUTER_FREE_ONLY_VAR)
+        .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 fn compatible_base_url() -> Option<String> {
@@ -244,7 +435,7 @@ impl Default for RigLlm {
 #[derive(Clone, Default)]
 struct CacheWriteCounter(Arc<AtomicU64>);
 
-impl PromptHook<anthropic::completion::CompletionModel> for CacheWriteCounter {
+impl PromptHook<Steady<anthropic::completion::CompletionModel>> for CacheWriteCounter {
     fn on_completion_response(
         &self,
         _prompt: &rig::completion::Message,
@@ -294,7 +485,7 @@ impl RigLlm {
         let result = match provider {
             Provider::OpenAi => {
                 let client = openai::Client::new(&key).map_err(client_error)?;
-                run_agent!(client.agent(model), request, no_limit)
+                run_agent!(AgentBuilder::new(Steady::new(client.completion_model(model))), request, no_limit)
             }
             Provider::Anthropic => {
                 let client = anthropic::Client::new(&key).map_err(client_error)?;
@@ -314,15 +505,21 @@ impl RigLlm {
                 if self.prompt_caching {
                     completion_model = completion_model.with_prompt_caching();
                 }
-                run_agent!(AgentBuilder::new(completion_model), request, max_tokens, cache_writes.clone())
+                run_agent!(AgentBuilder::new(Steady::new(completion_model)), request, max_tokens, cache_writes.clone())
             }
             Provider::Gemini => {
                 let client = gemini::Client::new(&key).map_err(client_error)?;
-                run_agent!(client.agent(model), request, no_limit)
+                run_agent!(AgentBuilder::new(Steady::new(client.completion_model(model))), request, no_limit)
             }
             Provider::OpenRouter => {
                 let client = openrouter::Client::new(&key).map_err(client_error)?;
-                run_agent!(client.agent(model), request, no_limit)
+                let completion_model = client.completion_model(model);
+                let completion_model = if is_free_openrouter_model(model) {
+                    Steady::paced(completion_model, &FREE_MODEL_PACER)
+                } else {
+                    Steady::new(completion_model)
+                };
+                run_agent!(AgentBuilder::new(completion_model), request, no_limit)
             }
             Provider::OpenAiCompatible => {
                 let url = compatible_base_url()
@@ -339,7 +536,7 @@ impl RigLlm {
                     .build()
                     .map_err(client_error)?
                     .completions_api();
-                run_agent!(client.agent(model), request, no_limit)
+                run_agent!(AgentBuilder::new(Steady::new(client.completion_model(model))), request, no_limit)
             }
             Provider::Ollama => {
                 let mut builder = ollama::Client::builder().api_key(Nothing);
@@ -347,7 +544,7 @@ impl RigLlm {
                     builder = builder.base_url(url);
                 }
                 let client = builder.build().map_err(client_error)?;
-                run_agent!(client.agent(model), request, no_limit)
+                run_agent!(AgentBuilder::new(Steady::new(client.completion_model(model))), request, no_limit)
             }
         };
 
@@ -405,8 +602,8 @@ mod tests {
         assert_eq!(resolve_model("ft:gpt-4o:acme"), (Provider::OpenAi, "ft:gpt-4o:acme"));
         // OpenRouter names carry a vendor and sometimes a variant after a colon.
         assert_eq!(
-            resolve_model("openrouter:meta-llama/llama-3.3-70b-instruct:free"),
-            (Provider::OpenRouter, "meta-llama/llama-3.3-70b-instruct:free")
+            resolve_model("openrouter:cohere/north-mini-code:free"),
+            (Provider::OpenRouter, "cohere/north-mini-code:free")
         );
         assert_eq!(resolve_model("compatible:qwen2.5-coder"), (Provider::OpenAiCompatible, "qwen2.5-coder"));
         assert_eq!(resolve_model("openai-compatible:x"), (Provider::OpenAiCompatible, "x"));
@@ -442,6 +639,106 @@ mod tests {
         total += anthropic;
         total += openai;
         assert_eq!((total.input_tokens, total.cached_input_tokens, total.output_tokens), (18_400, 18_000, 100));
+    }
+
+    #[test]
+    fn only_passing_failures_are_worth_sending_again() {
+        // Seen live from OpenRouter for a free model.
+        assert!(is_transient(
+            "HttpError: Invalid status code 429 Too Many Requests with message: {\"error\":{\"message\":\"Provider returned error\",\"code\":429,\"metadata\":{\"raw\":\"google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly\"}}}"
+        ));
+        assert!(is_transient("HttpError: Invalid status code 503 Service Unavailable"));
+        assert!(is_transient("HttpError: Invalid status code 529 with message: overloaded_error"));
+        assert!(is_transient("ProviderError: Rate limit exceeded: free-models-per-min"));
+        assert!(is_transient("HttpError: error sending request for url"));
+        // The day's allowance is used up: waiting a minute changes nothing.
+        assert!(!is_transient("HttpError: Invalid status code 429 with message: Rate limit exceeded: free-models-per-day"));
+        // The request itself is wrong.
+        assert!(!is_transient("HttpError: Invalid status code 404 Not Found with message: model not found"));
+        assert!(!is_transient("HttpError: Invalid status code 401 Unauthorized"));
+        assert!(!is_transient("HttpError: Invalid status code 402 Payment Required"));
+        // A status decides; a 400 whose text mentions a timeout setting is still a 400.
+        assert!(!is_transient("HttpError: Invalid status code 400 with message: timeout must be positive"));
+        assert!(!is_transient("JsonError: missing field `choices`"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_turned_away_for_a_passing_reason_is_sent_again() {
+        let delays = [Duration::from_secs(5), Duration::from_secs(20)];
+        let started = Instant::now();
+
+        let mut sent = 0;
+        let reply: Result<&str, String> = send_with_retries(None, &delays, || {
+            sent += 1;
+            let outcome = if sent < 3 { Err("status code 429 Too Many Requests".to_string()) } else { Ok("done") };
+            async move { outcome }
+        })
+        .await;
+        assert_eq!((reply, sent), (Ok("done"), 3));
+        assert_eq!(started.elapsed(), Duration::from_secs(25));
+
+        // It gives up when the waits are used up...
+        let mut sent = 0;
+        let reply: Result<(), String> = send_with_retries(None, &delays, || {
+            sent += 1;
+            async { Err("status code 503".to_string()) }
+        })
+        .await;
+        assert_eq!((reply.is_err(), sent), (true, 3));
+
+        // ...and at once when sending again cannot help.
+        let mut sent = 0;
+        let reply: Result<(), String> = send_with_retries(None, &delays, || {
+            sent += 1;
+            async { Err("status code 404 model not found".to_string()) }
+        })
+        .await;
+        assert_eq!((reply.is_err(), sent), (true, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paced_requests_keep_their_distance_even_from_parallel_agents() {
+        let pacer = Pacer::new(Duration::from_secs(3));
+        let started = Instant::now();
+        // Three agents ask at the same moment.
+        tokio::join!(pacer.wait(), pacer.wait(), pacer.wait());
+        assert_eq!(started.elapsed(), Duration::from_secs(6));
+        assert_eq!(pacer.sent.load(Ordering::Relaxed), 3);
+
+        // After a quiet spell the next request goes out at once...
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let resumed = Instant::now();
+        pacer.wait().await;
+        assert_eq!(resumed.elapsed(), Duration::ZERO);
+        // ...and a retry is paced like any other request.
+        let reply: Result<(), String> =
+            send_with_retries(Some(&pacer), &[Duration::from_secs(1)], || async { Err("status code 429".to_string()) })
+                .await;
+        assert!(reply.is_err());
+        assert_eq!(pacer.sent.load(Ordering::Relaxed), 6);
+    }
+
+    #[test]
+    fn free_openrouter_models_are_recognised_by_their_suffix() {
+        assert!(is_free_openrouter_model("cohere/north-mini-code:free"));
+        assert!(!is_free_openrouter_model("cohere/north-mini-code"));
+        assert!(uses_free_tier(&["gpt-4o", "openrouter:cohere/north-mini-code:free"]));
+        assert!(!uses_free_tier(&["gpt-4o", "openrouter:cohere/north-mini-code"]));
+        // The suffix means nothing on another provider.
+        assert!(!uses_free_tier(&["ollama:some-model:free"]));
+    }
+
+    #[test]
+    fn every_credential_variable_is_on_the_secret_list() {
+        let secrets = secret_env_vars();
+        for provider in Provider::ALL {
+            for var in provider.key_vars() {
+                assert!(secrets.contains(var), "{var} is missing");
+            }
+        }
+        for var in ["OPENROUTER_API_KEY", "OPENROUTER_KEY", COMPATIBLE_KEY_VAR] {
+            assert!(secrets.contains(&var), "{var} is missing");
+        }
     }
 
     #[test]

@@ -45,7 +45,20 @@ pub struct AgentSettings {
 /// Errors that will not go away by waiting.
 fn is_permanent(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
-    ["401", "403", "unauthorized", "invalid_api_key", "invalid api key", "authentication", "permission", "is not set"]
+    [
+        "401",
+        "403",
+        "unauthorized",
+        "invalid_api_key",
+        "invalid api key",
+        "authentication",
+        "permission",
+        "is not set",
+        // Out of credit, or out of the day's free allowance: waiting seconds does not help.
+        "status code 402",
+        "payment required",
+        "per-day",
+    ]
         .iter()
         .any(|marker| lower.contains(marker))
 }
@@ -178,11 +191,28 @@ pub fn extract_json(text: &str, open: char, close: char) -> Option<Value> {
     }
     // Outermost delimiters.
     let start = text.find(open)?;
-    let end = text.rfind(close)?;
-    if end <= start {
-        return None;
+    if let Some(end) = text.rfind(close)
+        && end > start
+        && let Some(value) = parse(&text[start..=end])
+    {
+        return Some(value);
     }
-    parse(&text[start..=end])
+    // Several values with prose between them: a model that corrects itself
+    // writes its answer twice, and the last one is the one it stands by.
+    let mut last = None;
+    let mut from = start;
+    while let Some(offset) = text[from..].find(open) {
+        let at = from + offset;
+        let mut values = serde_json::Deserializer::from_str(&text[at..]).into_iter::<Value>();
+        match values.next() {
+            Some(Ok(value)) => {
+                last = Some(value);
+                from = at + values.byte_offset().max(1);
+            }
+            _ => from = at + open.len_utf8(),
+        }
+    }
+    last
 }
 
 pub fn parse_worker_reply(reply: &str) -> WorkerOutcome {
@@ -724,6 +754,13 @@ mod tests {
 
     #[test]
     fn hostile_replies_do_not_panic() {
+        // Seen live: a reviewer answered, wrote "Wait - I must correct the
+        // ordering", and answered again. The second answer is the answer.
+        assert_eq!(
+            extract_json("[{\"id\":1,\"status\":\"met\"}]\n\nWait, the correct answer is:\n\n[{\"id\":1,\"status\":\"unmet\"}]", '[', ']'),
+            Some(json!([{"id":1,"status":"unmet"}]))
+        );
+        assert_eq!(extract_json("first {\"a\": [1]} then {\"a\": [2]} done", '{', '}'), Some(json!({"a":[2]})));
         assert_eq!(extract_json("", '{', '}'), None);
         assert_eq!(extract_json("no json here", '{', '}'), None);
         assert_eq!(extract_json("} backwards {", '{', '}'), None);
@@ -946,6 +983,8 @@ mod tests {
         assert!(is_permanent("CompletionError: HTTP 401 Unauthorized"));
         assert!(is_permanent("Incorrect API key provided (invalid_api_key)"));
         assert!(is_permanent("OPENAI_API_KEY is not set"));
+        assert!(is_permanent("Invalid status code 429 with message: Rate limit exceeded: free-models-per-day"));
+        assert!(is_permanent("Invalid status code 402 Payment Required"));
         assert!(!is_permanent("HTTP 429 Too Many Requests: rate limit reached"));
         assert!(!is_permanent("503 service unavailable"));
         assert!(!is_permanent("connection reset by peer"));

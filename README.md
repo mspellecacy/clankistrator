@@ -18,7 +18,7 @@ To judge a project that already exists, without running any tasks:
 cargo run --release -- --check --design docs/sumcli_design.md --output ../sumcli
 ```
 
-A provider call that fails (rate limit, overload, network) is retried twice with a growing delay before it counts against the task. A task gets three retries, counted across failed attempts and failed reviews. After that it is marked failed, and every task that depends on it is marked failed too, so a run always ends. State is saved to `<output>/.clankistrator/state.json` after every task result, and `--resume` continues from it.
+A model request that is turned away for a passing reason (rate limit, overload, a dropped connection) is sent again up to three times with growing waits, so the agent keeps the turns it has already made. If the agent fails all the same, it is started again up to twice before the failure counts against the task. A task gets three retries, counted across failed attempts and failed reviews. After that it is marked failed, and every task that depends on it is marked failed too, so a run always ends. State is saved to `<output>/.clankistrator/state.json` after every task result, and `--resume` continues from it.
 
 ## Safety
 
@@ -98,10 +98,10 @@ A model is named as `prefix:model`. For three providers the prefix can be left o
 | Anthropic | `anthropic:` (optional) | `ANTHROPIC_API_KEY` | yes: probe and full runs |
 | Gemini | `gemini:` (optional) | `GEMINI_API_KEY` | no |
 | Ollama | `ollama:` | a running server; `OLLAMA_BASE_URL` if it is not on `http://localhost:11434` | no |
-| OpenRouter | `openrouter:` | `OPENROUTER_API_KEY` | no |
+| OpenRouter | `openrouter:` | `OPENROUTER_API_KEY` (or `OPENROUTER_KEY`) | probe only, with two free models (see below) |
 | OpenAI-compatible server | `compatible:` | `OPENAI_COMPATIBLE_BASE_URL` (for example `http://localhost:1234/v1`); `OPENAI_COMPATIBLE_API_KEY` if the server wants one | no |
 
-"Run live" says whether that path has been exercised against the real service by the maintainers. The rows marked "no" compile and are wired up the same way, but nobody has seen them work; probe before you trust them.
+"Run live" says whether that path has been exercised against the real service by the maintainers. The rows marked "no" compile and are wired up the same way, but nobody has seen them work; probe before you trust them. "Probe only" means a request and a tool call went through, and no full run has been made.
 
 Examples: `--model gpt-4o`, `--model ollama:qwen2.5-coder:14b`, `--model openrouter:vendor/model-name`, `--model compatible:whatever-your-server-calls-it`. OpenRouter and OpenAI-compatible servers are how to reach providers that have no row of their own.
 
@@ -117,9 +117,22 @@ For each model, `--probe` makes one plain request and then one tool call, in whi
 
 Every run also starts with one small request to each model it will use, so a mistyped model name or a dead key stops the run before any work is done.
 
+#### Free models on OpenRouter
+
+OpenRouter offers some models at no charge; their names end in `:free`, for example `--model openrouter:cohere/north-mini-code:free`. The list changes, so take names from [openrouter.ai/models](https://openrouter.ai/models) (filter by price) and probe them. On 2026-11-10 `cohere/north-mini-code:free` and `nvidia/nemotron-3-ultra-550b-a55b:free` passed the probe, and `google/gemma-4-31b-it:free` was turned away as rate-limited by its upstream provider.
+
+What to know before relying on them:
+
+- **The allowance is counted in requests.** An account that has never bought credits gets 50 free-model requests a day and 20 a minute; one that has bought 10 credits gets 1,000 a day. Every turn of an agent is one request, and a task takes a worker and a reviewer several turns each, so 50 requests is roughly one small project, or part of one. The run summary prints how many free-model requests the run made.
+- **Clankistrator spaces requests to free models** about 3 seconds apart, across all agents, to stay under the per-minute limit. Runs are slower for it.
+- **When the day's allowance is used up,** tasks fail and the run ends with exit code 1. The state is saved; `--resume` on a later day continues it.
+- **To make sure nothing is ever billed,** set `OPENROUTER_FREE_ONLY=true`. Any `openrouter:` model whose name does not end in `:free` is then refused before a request is sent.
+- **Free endpoints may keep and train on what you send.** The prompts contain your design document and the generated code. Check the model's page and your OpenRouter privacy settings if that matters for the project.
+- **Free models are small or heavily shared.** Passing the probe shows that tool calls work, not that the model can build your design. A stronger `--review-model` still tells you honestly whether it did.
+
 rig's own log lines are held at `warn` because at `info` it prints every tool call with its full arguments and result; set `RUST_LOG=info` to see them.
 
-Settings are read from the environment, `.env.local` and `.env` (in that order of precedence): the variables in the table above, `DEFAULT_MODEL`, `WORKING_DIRECTORY` and `LOG_LEVEL` (`RUST_LOG` overrides it).
+Settings are read from the environment, `.env.local` and `.env` (in that order of precedence): the variables in the table above, `OPENROUTER_FREE_ONLY`, `DEFAULT_MODEL`, `WORKING_DIRECTORY` and `LOG_LEVEL` (`RUST_LOG` overrides it). None of the key variables is passed on to the commands that agents run.
 
 ## The TUI
 

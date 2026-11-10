@@ -16,9 +16,6 @@ use crate::tools::{Sandbox, ToolError};
 const OUTPUT_HEAD_BYTES: usize = 4_000;
 const OUTPUT_TAIL_BYTES: usize = 8_000;
 
-/// Credentials that generated code and its build scripts have no business seeing.
-const SCRUBBED_ENV: &[&str] = &["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"];
-
 #[derive(Deserialize, Serialize)]
 pub struct ExecuteCommandArgs {
     pub command: String,
@@ -209,7 +206,8 @@ impl ExecuteCommand {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        for key in SCRUBBED_ENV {
+        // Credentials that generated code and its build scripts have no business seeing.
+        for key in crate::llm::secret_env_vars() {
             cmd.env_remove(key);
         }
         // Keep git from discovering a repository that encloses the output
@@ -473,7 +471,9 @@ mod tests {
             .filter(|(_, value)| value.is_none())
             .map(|(key, _)| key.to_string_lossy().into_owned())
             .collect();
-        for key in SCRUBBED_ENV {
+        let secrets = crate::llm::secret_env_vars();
+        assert!(secrets.contains(&"OPENAI_API_KEY") && secrets.contains(&"OPENROUTER_KEY"));
+        for key in secrets {
             assert!(removed.iter().any(|k| k == key), "{key} must be removed from the command's environment");
         }
         assert_eq!(cmd.as_std().get_current_dir(), Some(tool.sandbox.root()));

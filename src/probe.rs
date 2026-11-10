@@ -117,7 +117,10 @@ pub async fn preflight(llm: &dyn Llm, models: &[&str]) -> Result<TokenUsage> {
         }
         seen.push(model);
         match completion(llm, model).await {
-            Ok(used) => usage += used,
+            Ok(used) => {
+                tracing::info!("Preflight: {model} answered a test request");
+                usage += used;
+            }
             Err(e) => bail!("model {model} is not usable: {e}"),
         }
     }
