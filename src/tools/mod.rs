@@ -11,6 +11,8 @@ pub use file_system::{ListFiles, ReadFile, WriteFile};
 pub mod command_executor;
 pub use command_executor::ExecuteCommand;
 
+pub mod probe;
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ToolError(pub String);
 impl std::fmt::Display for ToolError {
@@ -125,13 +127,20 @@ pub enum ToolAccess {
     Inspect,
     /// Inspect plus writing files (workers).
     Full,
+    /// Only the harmless probe tool, which returns the code for this token.
+    Probe(u32),
 }
 
 impl ToolAccess {
     pub fn build(self, sandbox: &Sandbox) -> Vec<Box<dyn ToolDyn>> {
         let mut tools: Vec<Box<dyn ToolDyn>> = Vec::new();
-        if self == ToolAccess::None {
-            return tools;
+        match self {
+            ToolAccess::None => return tools,
+            ToolAccess::Probe(token) => {
+                tools.push(Box::new(probe::GetCode { token }));
+                return tools;
+            }
+            ToolAccess::Inspect | ToolAccess::Full => {}
         }
         tools.push(Box::new(ReadFile { sandbox: sandbox.clone() }));
         tools.push(Box::new(ListFiles { sandbox: sandbox.clone() }));
@@ -213,5 +222,6 @@ mod tests {
         assert!(names(ToolAccess::None).is_empty());
         assert!(!names(ToolAccess::Inspect).contains(&"write_file".to_string()));
         assert!(names(ToolAccess::Full).contains(&"write_file".to_string()));
+        assert_eq!(names(ToolAccess::Probe(1)), ["get_code"], "the probe gets no file or command tools");
     }
 }

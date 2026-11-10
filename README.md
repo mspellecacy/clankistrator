@@ -81,6 +81,7 @@ The summary reports input tokens as one total, with the part read from the cache
 | `--no-prompt-cache` | off | Do not ask Anthropic to cache prompts between an agent's turns |
 | `--check` | off | Only check the project in `--output` against `--design` and print the findings. Exits 1 if anything is unmet |
 | `--resume` | off | Continue the run saved in the output directory. Interrupted and failed tasks are queued again |
+| `--probe <MODEL>...` | | Test the given models (one request and one tool call each) instead of running |
 | `--mcp-server` | off | Run as an MCP server instead (see below) |
 
 Headless exit codes: 0 if every task completed and the design check found nothing unmet; 1 if a task failed, a design requirement is unmet, the design check could not be completed, or the run could not start; 2 if the step limit stopped it; 130 on Ctrl-C.
@@ -89,20 +90,36 @@ Every worker and reviewer reply is kept in `<output>/.clankistrator/transcripts/
 
 ### Models and providers
 
-The provider is chosen from the model name: names starting with `claude` use Anthropic, names starting with `gemini` use Gemini, anything else uses OpenAI. A prefix overrides that: `openai:`, `anthropic:`, `gemini:` or `ollama:` (for example `--model ollama:qwen2.5-coder:14b`).
+A model is named as `prefix:model`. For three providers the prefix can be left out: names starting with `claude` go to Anthropic, names starting with `gemini` go to Gemini, and any other bare name goes to OpenAI. The rest are only ever chosen by prefix.
 
-| Provider | Needs |
-| --- | --- |
-| OpenAI | `OPENAI_API_KEY` |
-| Anthropic | `ANTHROPIC_API_KEY` |
-| Gemini | `GEMINI_API_KEY` |
-| Ollama | a running server; `OLLAMA_BASE_URL` if it is not on `http://localhost:11434` |
+| Provider | Prefix | Needs | Run live |
+| --- | --- | --- | --- |
+| OpenAI | `openai:` (optional) | `OPENAI_API_KEY` | yes: probe and full runs |
+| Anthropic | `anthropic:` (optional) | `ANTHROPIC_API_KEY` | yes: probe and full runs |
+| Gemini | `gemini:` (optional) | `GEMINI_API_KEY` | no |
+| Ollama | `ollama:` | a running server; `OLLAMA_BASE_URL` if it is not on `http://localhost:11434` | no |
+| OpenRouter | `openrouter:` | `OPENROUTER_API_KEY` | no |
+| OpenAI-compatible server | `compatible:` | `OPENAI_COMPATIBLE_BASE_URL` (for example `http://localhost:1234/v1`); `OPENAI_COMPATIBLE_API_KEY` if the server wants one | no |
 
-The model must support tool calling. Clankistrator checks for the key before it starts and stops with a message if it is missing.
+"Run live" says whether that path has been exercised against the real service by the maintainers. The rows marked "no" compile and are wired up the same way, but nobody has seen them work; probe before you trust them.
+
+Examples: `--model gpt-4o`, `--model ollama:qwen2.5-coder:14b`, `--model openrouter:vendor/model-name`, `--model compatible:whatever-your-server-calls-it`. OpenRouter and OpenAI-compatible servers are how to reach providers that have no row of their own.
+
+Workers and reviewers can use different models, from different providers: `--model` builds, `--review-model` judges. A cheaper model that builds with a stronger one that reviews is a reasonable combination.
+
+#### Checking that a model works
+
+```bash
+cargo run --release -- --probe gpt-4o claude-sonnet-5-5 ollama:llama3.2
+```
+
+For each model, `--probe` makes one plain request and then one tool call, in which the model has to call a tool with a list argument and repeat a code that only the tool knows. It uses no files and runs no commands, and costs a few hundred tokens per model. A model that fails the tool call cannot be used, because workers and reviewers do everything through tools. The exit code is 0 only if every model passed.
+
+Every run also starts with one small request to each model it will use, so a mistyped model name or a dead key stops the run before any work is done.
 
 rig's own log lines are held at `warn` because at `info` it prints every tool call with its full arguments and result; set `RUST_LOG=info` to see them.
 
-Settings are read from the environment, `.env.local` and `.env` (in that order of precedence): the keys above, `DEFAULT_MODEL`, `WORKING_DIRECTORY`, `OLLAMA_BASE_URL` and `LOG_LEVEL` (`RUST_LOG` overrides it).
+Settings are read from the environment, `.env.local` and `.env` (in that order of precedence): the variables in the table above, `DEFAULT_MODEL`, `WORKING_DIRECTORY` and `LOG_LEVEL` (`RUST_LOG` overrides it).
 
 ## The TUI
 
@@ -137,7 +154,7 @@ Any Markdown works; the whole file is given to the planner and to every agent, s
 - Agents share one working directory with no locking. Tasks that run in parallel can overwrite each other's files. The reviewer usually catches the resulting breakage, but a plan with fewer parallel tasks is more reliable.
 - The reviewer has no write tool, but it can run commands, and a command can modify files.
 - Token counts only include agent runs that finished; a run that errored or hit its turn limit is not counted.
-- The test suite drives the orchestrator with scripted model replies; it makes no provider calls. OpenAI and Anthropic have been run against the real services; Gemini and Ollama have not.
+- The test suite drives the orchestrator with scripted model replies; it makes no provider calls. Which providers have been run against the real services is listed in the provider table. A run that mixes providers (one building, another reviewing) has been done only as a standalone `--check`, not as a full run.
 - Changing the model in the TUI affects the next pass, not agents already running.
 
 ## Development

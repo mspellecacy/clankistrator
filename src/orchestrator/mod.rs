@@ -765,7 +765,7 @@ mod tests {
             ToolAccess::Inspect if request.prompt.contains("# Whole-project check") => Kind::DesignCheck,
             ToolAccess::Inspect => Kind::Review,
             ToolAccess::None if request.prompt.contains("checklist for verifying") => Kind::Requirements,
-            ToolAccess::None => Kind::Plan,
+            ToolAccess::None | ToolAccess::Probe(_) => Kind::Plan,
         }
     }
 

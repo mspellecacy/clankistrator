@@ -4,6 +4,7 @@ pub mod llm;
 pub mod mcp;
 pub mod orchestrator;
 pub mod parser;
+pub mod probe;
 pub mod tools;
 pub mod tui;
 
@@ -93,6 +94,11 @@ struct Args {
     /// Run as an MCP server on stdio instead of orchestrating
     #[arg(long)]
     mcp_server: bool,
+
+    /// Test the given models instead of orchestrating: one plain request and one
+    /// tool call each. Uses no files and runs no commands
+    #[arg(long, num_args = 1.., value_name = "MODEL", conflicts_with_all = ["resume", "mcp_server", "check"])]
+    probe: Vec<String>,
 }
 
 fn default_model() -> String {
@@ -150,6 +156,10 @@ async fn run() -> Result<ExitCode> {
         let server = mcp::McpServer::new(Arc::new(llm), args.model.unwrap_or_else(default_model));
         server.run().await?;
         return Ok(ExitCode::SUCCESS);
+    }
+
+    if !args.probe.is_empty() {
+        return run_probe(&args).await;
     }
 
     if !args.design.is_file() {
@@ -258,8 +268,16 @@ async fn run() -> Result<ExitCode> {
         );
     }
 
-    let context: SharedContext = Arc::new(Mutex::new(context));
     let llm = RigLlm { prompt_caching: !args.no_prompt_cache };
+    // One small request per model, so a mistyped model name stops the run here
+    // instead of after a worker has spent tokens on something nobody can review.
+    let mut context = context;
+    let used = probe::preflight(&llm, &[context.model.as_str(), context.reviewer_model()]).await?;
+    context.input_tokens += used.input_tokens;
+    context.cached_input_tokens += used.cached_input_tokens;
+    context.output_tokens += used.output_tokens;
+
+    let context: SharedContext = Arc::new(Mutex::new(context));
     let orchestrator = Orchestrator::new(Arc::new(llm), design_content, sandbox);
 
     if use_tui {
@@ -368,6 +386,44 @@ fn print_design_report(findings: &[Finding], list_met: bool) {
     }
 }
 
+/// `--probe`: find out whether each model works here, and say exactly what failed.
+async fn run_probe(args: &Args) -> Result<ExitCode> {
+    tracing_subscriber::fmt().with_env_filter(env_filter()).with_writer(std::io::stderr).init();
+    let llm = RigLlm { prompt_caching: !args.no_prompt_cache };
+    let mut all_passed = true;
+    for model in &args.probe {
+        let report = probe::probe_model(&llm, model).await;
+        all_passed &= report.passed();
+        println!("\n{} (provider: {})", report.model, report.provider);
+        let line = |label: &str, result: &Result<llm::TokenUsage, String>| match result {
+            Ok(usage) => println!(
+                "  {label:<12} ok      tokens: {}",
+                format_tokens(usage.input_tokens, usage.cached_input_tokens, usage.output_tokens)
+            ),
+            Err(why) => println!("  {label:<12} FAILED  {why}"),
+        };
+        line("completion", &report.completion);
+        match &report.tool_call {
+            Some(result) => line("tool call", result),
+            None => println!("  {:<12} skipped", "tool call"),
+        }
+        if let Ok(usage) = &report.completion
+            && usage.input_tokens == 0
+        {
+            println!("  note: the provider reported no token usage, so run summaries will show 0 for this model");
+        }
+    }
+    println!(
+        "\n{}",
+        if all_passed {
+            "Every model passed. Models that pass can be used with --model and --review-model."
+        } else {
+            "Not every model passed. A model that fails the tool call cannot be used: workers and reviewers depend on tools."
+        }
+    );
+    Ok(if all_passed { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+}
+
 /// `--check`: judge the project already in the output directory against the
 /// design, print the findings, and change nothing.
 async fn run_check(args: &Args, design_content: String) -> Result<ExitCode> {
@@ -391,6 +447,7 @@ async fn run_check(args: &Args, design_content: String) -> Result<ExitCode> {
         retry_delay: PROVIDER_RETRY_DELAY,
     };
     let llm = RigLlm { prompt_caching: !args.no_prompt_cache };
+    probe::preflight(&llm, &[settings.review_model.as_str()]).await?;
     let check = tokio::select! {
         check = check_design(&llm, &[], &settings) => check?,
         _ = tokio::signal::ctrl_c() => return Ok(ExitCode::from(130)),

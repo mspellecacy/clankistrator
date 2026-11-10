@@ -13,7 +13,7 @@ use anyhow::{Result, anyhow, bail};
 use rig::agent::{AgentBuilder, HookAction, PromptHook};
 use rig::client::{CompletionClient, Nothing};
 use rig::completion::{Prompt, PromptError};
-use rig::providers::{anthropic, gemini, ollama, openai};
+use rig::providers::{anthropic, gemini, ollama, openai, openrouter};
 
 use crate::tools::{Sandbox, ToolAccess};
 
@@ -61,7 +61,7 @@ impl TokenUsage {
     fn normalised(provider: Provider, input: u64, cached: u64, cache_writes: u64, output: u64) -> Self {
         let input_tokens = match provider {
             Provider::Anthropic => input + cached + cache_writes,
-            Provider::OpenAi | Provider::Gemini | Provider::Ollama => input.max(cached),
+            _ => input.max(cached),
         };
         Self { input_tokens, cached_input_tokens: cached, output_tokens: output }
     }
@@ -102,16 +102,47 @@ pub enum Provider {
     Anthropic,
     Gemini,
     Ollama,
+    /// openrouter.ai: one key, models from many vendors.
+    OpenRouter,
+    /// Any server that speaks the OpenAI chat-completions protocol
+    /// (LM Studio, vLLM, llama.cpp, a gateway), at a URL you supply.
+    OpenAiCompatible,
 }
 
+/// Where an OpenAI-compatible server is, and its key if it wants one.
+pub const COMPATIBLE_URL_VAR: &str = "OPENAI_COMPATIBLE_BASE_URL";
+pub const COMPATIBLE_KEY_VAR: &str = "OPENAI_COMPATIBLE_API_KEY";
+
 impl Provider {
-    /// The environment variable holding this provider's API key, if it needs one.
+    pub const ALL: [Provider; 6] = [
+        Provider::OpenAi,
+        Provider::Anthropic,
+        Provider::Gemini,
+        Provider::Ollama,
+        Provider::OpenRouter,
+        Provider::OpenAiCompatible,
+    ];
+
+    /// The prefix that selects this provider in a model spec.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Provider::OpenAi => "openai",
+            Provider::Anthropic => "anthropic",
+            Provider::Gemini => "gemini",
+            Provider::Ollama => "ollama",
+            Provider::OpenRouter => "openrouter",
+            Provider::OpenAiCompatible => "compatible",
+        }
+    }
+
+    /// The environment variable holding this provider's API key, if it must have one.
     pub fn key_var(self) -> Option<&'static str> {
         match self {
             Provider::OpenAi => Some("OPENAI_API_KEY"),
             Provider::Anthropic => Some("ANTHROPIC_API_KEY"),
             Provider::Gemini => Some("GEMINI_API_KEY"),
-            Provider::Ollama => None,
+            Provider::OpenRouter => Some("OPENROUTER_API_KEY"),
+            Provider::Ollama | Provider::OpenAiCompatible => None,
         }
     }
 }
@@ -121,7 +152,8 @@ impl Provider {
 /// An explicit `provider:model` prefix always wins (`ollama:llama3.2`,
 /// `anthropic:claude-...`). Without one, names starting with `claude` go to
 /// Anthropic, names starting with `gemini` go to Gemini, and everything else
-/// goes to OpenAI.
+/// goes to OpenAI. Ollama, OpenRouter and OpenAI-compatible servers are only
+/// ever chosen by prefix.
 pub fn resolve_model(spec: &str) -> (Provider, &str) {
     let spec = spec.trim();
     if let Some((prefix, rest)) = spec.split_once(':') {
@@ -130,6 +162,8 @@ pub fn resolve_model(spec: &str) -> (Provider, &str) {
             "anthropic" => Some(Provider::Anthropic),
             "gemini" | "google" => Some(Provider::Gemini),
             "ollama" => Some(Provider::Ollama),
+            "openrouter" => Some(Provider::OpenRouter),
+            "compatible" | "openai-compatible" => Some(Provider::OpenAiCompatible),
             _ => None,
         };
         if let Some(provider) = provider {
@@ -170,7 +204,17 @@ pub fn check_credentials(model_spec: &str) -> Result<()> {
     if model.is_empty() {
         bail!("model name is empty");
     }
+    if provider == Provider::OpenAiCompatible && compatible_base_url().is_none() {
+        bail!(
+            "{COMPATIBLE_URL_VAR} is not set. Models with the compatible: prefix need the URL of an \
+             OpenAI-compatible server, for example http://localhost:1234/v1."
+        );
+    }
     api_key(provider).map(|_| ())
+}
+
+fn compatible_base_url() -> Option<String> {
+    std::env::var(COMPATIBLE_URL_VAR).ok().filter(|url| !url.trim().is_empty())
 }
 
 fn ollama_base_url() -> Option<String> {
@@ -276,6 +320,27 @@ impl RigLlm {
                 let client = gemini::Client::new(&key).map_err(client_error)?;
                 run_agent!(client.agent(model), request, no_limit)
             }
+            Provider::OpenRouter => {
+                let client = openrouter::Client::new(&key).map_err(client_error)?;
+                run_agent!(client.agent(model), request, no_limit)
+            }
+            Provider::OpenAiCompatible => {
+                let url = compatible_base_url()
+                    .ok_or_else(|| LlmError::Other(anyhow!("{COMPATIBLE_URL_VAR} is not set")))?;
+                // Local servers usually ignore the key, but the header must not be empty.
+                let key = std::env::var(COMPATIBLE_KEY_VAR)
+                    .ok()
+                    .filter(|key| !looks_like_placeholder(key))
+                    .unwrap_or_else(|| "not-needed".to_string());
+                // Compatible servers implement chat completions, not OpenAI's newer Responses API.
+                let client = openai::Client::builder()
+                    .api_key(key)
+                    .base_url(url)
+                    .build()
+                    .map_err(client_error)?
+                    .completions_api();
+                run_agent!(client.agent(model), request, no_limit)
+            }
             Provider::Ollama => {
                 let mut builder = ollama::Client::builder().api_key(Nothing);
                 if let Some(url) = ollama_base_url() {
@@ -338,6 +403,18 @@ mod tests {
         assert_eq!(resolve_model("anthropic:some-model"), (Provider::Anthropic, "some-model"));
         // An unknown prefix is part of the model name.
         assert_eq!(resolve_model("ft:gpt-4o:acme"), (Provider::OpenAi, "ft:gpt-4o:acme"));
+        // OpenRouter names carry a vendor and sometimes a variant after a colon.
+        assert_eq!(
+            resolve_model("openrouter:meta-llama/llama-3.3-70b-instruct:free"),
+            (Provider::OpenRouter, "meta-llama/llama-3.3-70b-instruct:free")
+        );
+        assert_eq!(resolve_model("compatible:qwen2.5-coder"), (Provider::OpenAiCompatible, "qwen2.5-coder"));
+        assert_eq!(resolve_model("openai-compatible:x"), (Provider::OpenAiCompatible, "x"));
+        // Without the prefix, a vendor-style name is NOT sent to OpenRouter.
+        assert_eq!(resolve_model("anthropic/claude-x").0, Provider::OpenAi);
+        for provider in Provider::ALL {
+            assert_eq!(resolve_model(&format!("{}:m", provider.prefix())), (provider, "m"));
+        }
     }
 
     #[test]
