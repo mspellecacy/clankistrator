@@ -11,7 +11,7 @@ use tokio::task::JoinSet;
 use crate::agents::{self, AgentSettings, ReviewVerdict, WorkerOutcome};
 use crate::context::{
     AgentRole, Finding, MAX_RETRIES, Requirement, ProjectContext, ProjectTask, RunPhase, STATE_DIR, TaskDef,
-    TaskStatus, validate_task_graph,
+    TaskStatus, validate_task_graph, STEP_UP_AFTER,
 };
 use crate::llm::{AgentRequest, Llm, TokenUsage};
 use crate::tools::{Sandbox, ToolAccess};
@@ -248,11 +248,72 @@ pub async fn check_design(
     bail!("the design check could not be completed: {problem}")
 }
 
-fn record_usage(ctx: &mut ProjectContext, usage: TokenUsage, calls: u64) {
+fn record_usage(ctx: &mut ProjectContext, model: &str, usage: TokenUsage, calls: u64) {
     ctx.input_tokens += usage.input_tokens;
     ctx.cached_input_tokens += usage.cached_input_tokens;
     ctx.output_tokens += usage.output_tokens;
     ctx.llm_calls += calls;
+    let of_model = ctx.model_usage.entry(model.to_string()).or_default();
+    of_model.calls += calls;
+    of_model.input_tokens += usage.input_tokens;
+    of_model.cached_input_tokens += usage.cached_input_tokens;
+    of_model.output_tokens += usage.output_tokens;
+}
+
+/// A worker's attempt on `model` failed for a reason that lies in the work.
+/// After `STEP_UP_AFTER` such failures the task moves to the next worker
+/// model. The count of attempts (`retries`) is not reset by the move, so a
+/// task cannot go round the pool for ever.
+fn note_failed_attempt(ctx: &mut ProjectContext, task_id: &str, model: &str) {
+    ctx.model_usage.entry(model.to_string()).or_default().rejected += 1;
+    let Some(failures) = ctx.get_task_mut(task_id).map(|t| {
+        t.failures_on_model += 1;
+        t.failures_on_model
+    }) else {
+        return;
+    };
+    if failures < STEP_UP_AFTER {
+        return;
+    }
+    if let Some(next) = ctx.next_model_up(model) {
+        tracing::warn!(
+            "Orchestrator [{task_id}]: {failures} failed attempts on {model}; the next attempt goes to {next}"
+        );
+        if let Some(t) = ctx.get_task_mut(task_id) {
+            t.model = Some(next);
+            t.failures_on_model = 0;
+        }
+    }
+}
+
+fn apply_worker_outcome(ctx: &mut ProjectContext, task_id: &str, model: &str, outcome: WorkerOutcome) {
+    match outcome {
+        WorkerOutcome::ModelUnavailable { reason } => {
+            ctx.retire_model(model, &reason);
+            let replacement = ctx.usable_pool().first().map(|m| m.to_string());
+            match replacement {
+                Some(next) => {
+                    // The task is not at fault: hand it on without counting an attempt.
+                    tracing::warn!(
+                        "Orchestrator [{task_id}]: {model} cannot be used for the rest of this run ({reason}); \
+                         its tasks go to {next}"
+                    );
+                    if let Some(t) = ctx.get_task_mut(task_id) {
+                        t.status = TaskStatus::Pending;
+                        t.model = None;
+                        t.failures_on_model = 0;
+                    }
+                }
+                None => {
+                    tracing::error!("Orchestrator [{task_id}]: {model} cannot be used and no other worker model is left: {reason}");
+                    if let Some(t) = ctx.get_task_mut(task_id) {
+                        t.status = TaskStatus::Failed { error: format!("The model call failed: {reason}") };
+                    }
+                }
+            }
+        }
+        other => apply_attempt(ctx, task_id, model, other),
+    }
 }
 
 fn save(ctx: &ProjectContext) {
@@ -261,9 +322,11 @@ fn save(ctx: &ProjectContext) {
     }
 }
 
-fn apply_worker_outcome(ctx: &mut ProjectContext, task_id: &str, outcome: WorkerOutcome) {
+fn apply_attempt(ctx: &mut ProjectContext, task_id: &str, model: &str, outcome: WorkerOutcome) {
     match outcome {
+        WorkerOutcome::ModelUnavailable { .. } => {}
         WorkerOutcome::Completed { summary, files, new_tasks } => {
+            let inherited_model = ctx.get_task(task_id).and_then(|t| t.model.clone());
             if let Some(t) = ctx.get_task_mut(task_id) {
                 t.status = TaskStatus::ReadyForReview { output_summary: summary };
                 t.files = files;
@@ -289,12 +352,15 @@ fn apply_worker_outcome(ctx: &mut ProjectContext, task_id: &str, outcome: Worker
                 if !def.dependencies.iter().any(|dep| dep == task_id) {
                     def.dependencies.push(task_id.to_string());
                 }
+                // A follow-up belongs with the work it came from, so it stays on that model.
+                def.model = inherited_model.clone();
                 let id = ctx.next_task_id();
                 tracing::info!("Orchestrator [{task_id}]: worker added follow-up task {id}: {}", def.title);
                 ctx.tasks.push(ProjectTask::new(id, def));
             }
         }
         WorkerOutcome::Failed { reason } => {
+            let mut given_up = true;
             if let Some(t) = ctx.get_task_mut(task_id) {
                 t.retries += 1;
                 if t.retries > MAX_RETRIES {
@@ -304,7 +370,13 @@ fn apply_worker_outcome(ctx: &mut ProjectContext, task_id: &str, outcome: Worker
                     tracing::warn!("Orchestrator [{task_id}]: attempt failed, will retry: {reason}");
                     t.status = TaskStatus::Pending;
                     t.feedback = Some(reason);
+                    given_up = false;
                 }
+            }
+            if given_up {
+                ctx.model_usage.entry(model.to_string()).or_default().rejected += 1;
+            } else {
+                note_failed_attempt(ctx, task_id, model);
             }
         }
     }
@@ -316,8 +388,38 @@ fn apply_review(
     summary: String,
     verdict: Result<ReviewVerdict, crate::llm::LlmError>,
 ) {
+    // The model whose work is being judged.
+    let Some(model) = ctx.get_task(task_id).map(|t| ctx.worker_model_for(t)) else { return };
+    match &verdict {
+        Ok(ReviewVerdict::Passed { .. }) => ctx.model_usage.entry(model.clone()).or_default().passed += 1,
+        Ok(ReviewVerdict::Rejected(_)) => {
+            // Counted as a failed attempt of the model only if the task goes back to it.
+            if ctx.get_task(task_id).is_some_and(|t| t.retries < MAX_RETRIES) {
+                note_failed_attempt(ctx, task_id, &model);
+            } else {
+                ctx.model_usage.entry(model.clone()).or_default().rejected += 1;
+            }
+        }
+        _ => {}
+    }
     let Some(t) = ctx.get_task_mut(task_id) else { return };
     match verdict {
+        Ok(ReviewVerdict::Unproven(feedback)) => {
+            // Nothing was found wrong with the work, so the model that did it
+            // is not marked down and the task does not move to another one.
+            t.retries += 1;
+            if t.retries > MAX_RETRIES {
+                tracing::error!("Orchestrator [{task_id}]: the review could not be substantiated, giving up");
+                t.status = TaskStatus::Failed { error: format!("Failed review: {feedback}") };
+            } else {
+                tracing::warn!(
+                    "Orchestrator [{task_id}]: the reviewer found nothing wrong but did not show its evidence; \
+                     sending the task back to the worker"
+                );
+                t.status = TaskStatus::Pending;
+                t.feedback = Some(format!("The QA reviewer rejected your work:\n{feedback}"));
+            }
+        }
         Ok(ReviewVerdict::Passed { notes }) => {
             if notes.is_empty() {
                 tracing::info!("Orchestrator [{task_id}]: passed review");
@@ -330,6 +432,7 @@ fn apply_review(
             t.status = TaskStatus::RequiresHumanApproval { output_summary: summary };
             t.feedback = None;
             t.retries = 0;
+            t.failures_on_model = 0;
             t.review_notes = notes;
         }
         Ok(ReviewVerdict::Rejected(feedback)) => {
@@ -418,7 +521,7 @@ impl Orchestrator {
             let (tasks, usage, calls) =
                 plan_tasks(self.llm.as_ref(), &model, &self.design_doc, &self.sandbox).await?;
             let mut ctx = context.lock().await;
-            record_usage(&mut ctx, usage, calls);
+            record_usage(&mut ctx, &model, usage, calls);
             ctx.tasks = tasks;
             save(&ctx);
         }
@@ -541,7 +644,7 @@ impl Orchestrator {
             }
             Ok(check) => {
                 save_transcript(self.sandbox.root(), "design-check", check.reply.as_deref());
-                record_usage(&mut ctx, check.usage, check.calls);
+                record_usage(&mut ctx, &settings.review_model, check.usage, check.calls);
                 ctx.requirements = check.requirements;
                 ctx.design_checked_task_count = ctx.tasks.len();
                 ctx.design_check = Some(check.findings);
@@ -574,6 +677,9 @@ impl Orchestrator {
                         assigned_role: AgentRole::Backend,
                         dependencies: Vec::new(),
                         acceptance_criteria: unmet.iter().map(|f| f.requirement.clone()).collect(),
+                        // These are what the earlier work missed, so they go to the
+                        // strongest worker model there is.
+                        model: (ctx.pool().len() > 1).then(|| ctx.strongest_model()),
                     };
                     ctx.tasks.push(ProjectTask::new(id, def));
                 } else {
@@ -599,9 +705,17 @@ impl Orchestrator {
             report.auto_approved += auto_approve(&mut ctx);
             let settings = self.settings(&ctx);
             let prior_work = describe_prior_work(&ctx);
-            let ready: Vec<ProjectTask> = ctx.get_ready_tasks().into_iter().cloned().collect();
-            for task in &ready {
-                tracing::info!("Orchestrator [{}]: dispatching to {:?} worker", task.id, task.assigned_role);
+            let ready: Vec<(ProjectTask, String)> = ctx
+                .get_ready_tasks()
+                .into_iter()
+                .map(|task| (task.clone(), ctx.worker_model_for(task)))
+                .collect();
+            for (task, model) in &ready {
+                tracing::info!(
+                    "Orchestrator [{}]: dispatching to {:?} worker on {model}",
+                    task.id,
+                    task.assigned_role
+                );
                 if let Some(t) = ctx.get_task_mut(&task.id) {
                     t.status = TaskStatus::InProgress;
                 }
@@ -611,25 +725,25 @@ impl Orchestrator {
 
         // 1. Execution
         let mut running = JoinSet::new();
-        for task in ready {
+        for (task, model) in ready {
             let llm = Arc::clone(&self.llm);
             let semaphore = Arc::clone(&self.semaphore);
-            let settings = settings.clone();
+            let settings = AgentSettings { model, ..settings.clone() };
             let prior_work = prior_work.clone();
             report.executed += 1;
             running.spawn(async move {
                 let _permit = semaphore.acquire().await.expect("semaphore is never closed");
                 let run = agents::execute_task(llm.as_ref(), &task, &prior_work, &settings).await;
-                (task.id, run)
+                (task.id, settings.model, run)
             });
         }
         while let Some(joined) = running.join_next().await {
             let mut ctx = context.lock().await;
             match joined {
-                Ok((task_id, run)) => {
+                Ok((task_id, model, run)) => {
                     save_transcript(self.sandbox.root(), &format!("{task_id}.worker"), run.reply.as_deref());
-                    record_usage(&mut ctx, run.usage, run.calls);
-                    apply_worker_outcome(&mut ctx, &task_id, run.outcome);
+                    record_usage(&mut ctx, &model, run.usage, run.calls);
+                    apply_worker_outcome(&mut ctx, &task_id, &model, run.outcome);
                 }
                 Err(e) => tracing::error!("Orchestrator: a worker crashed: {e}"),
             }
@@ -676,7 +790,7 @@ impl Orchestrator {
             match joined {
                 Ok((task_id, summary, run)) => {
                     save_transcript(self.sandbox.root(), &format!("{task_id}.review"), run.reply.as_deref());
-                    record_usage(&mut ctx, run.usage, run.calls);
+                    record_usage(&mut ctx, &settings.review_model, run.usage, run.calls);
                     apply_review(&mut ctx, &task_id, summary, run.outcome);
                 }
                 Err(e) => tracing::error!("Orchestrator: a reviewer crashed: {e}"),
@@ -1254,8 +1368,119 @@ mod tests {
         let (_dir, orchestrator, context) = setup(llm.clone(), true, 50);
 
         assert_eq!(orchestrator.run(&context, Hitl::Stdin).await.unwrap(), RunEnd::Finished);
-        assert_eq!(llm.requests(Kind::Worker).len(), MAX_RETRIES as usize + 1);
-        assert_eq!(context.lock().await.count_failed(), 2);
+        // A dead key does not get better: one request, and the task fails without further attempts.
+        assert_eq!(llm.requests(Kind::Worker).len(), 1);
+        let ctx = context.lock().await;
+        assert_eq!(ctx.count_failed(), 2);
+        assert!(ctx.is_retired("test-model"));
+    }
+
+    /// A worker that says which model it ran on, so that a scripted reviewer can judge by it.
+    fn signed(request: &AgentRequest) -> String {
+        format!(r#"{{"status": "completed", "summary": "built by {}", "files_created": ["src/lib.rs"]}}"#, request.model)
+    }
+
+    fn worker_models(llm: &ScriptedLlm) -> Vec<String> {
+        llm.requests(Kind::Worker).into_iter().map(|r| r.model).collect()
+    }
+
+    #[tokio::test]
+    async fn a_task_moves_to_the_next_worker_model_after_two_failed_attempts() {
+        let llm = ScriptedLlm::new(|kind, request, earlier| {
+            Ok(match kind {
+                Kind::Worker => signed(request),
+                Kind::Review if request.prompt.contains("built by cheap") => {
+                    unmet_if(&request.prompt, "builds", "cargo build: error[E0425]")
+                }
+                _ => agreeable(kind, request, earlier)?,
+            })
+        });
+        let (_dir, orchestrator, context) = setup(llm.clone(), true, 50);
+        context.lock().await.worker_models = vec!["cheap".into(), "strong".into()];
+
+        assert_eq!(orchestrator.run(&context, Hitl::Stdin).await.unwrap(), RunEnd::Finished);
+        // Every task starts on the cheapest model, whatever happened to the task before it.
+        assert_eq!(worker_models(&llm), ["cheap", "cheap", "strong", "cheap", "cheap", "strong"]);
+        let ctx = context.lock().await;
+        assert_eq!(ctx.count_completed(), 2);
+        assert_eq!((ctx.model_usage["cheap"].passed, ctx.model_usage["cheap"].rejected), (0, 4));
+        assert_eq!((ctx.model_usage["strong"].passed, ctx.model_usage["strong"].rejected), (2, 0));
+        assert_eq!(ctx.model_usage["cheap"].calls, 4);
+        // The planner ran on the default model and is accounted for separately.
+        assert_eq!(ctx.model_usage["test-model"].calls, ctx.llm_calls - 6);
+    }
+
+    #[tokio::test]
+    async fn changing_model_does_not_give_a_task_more_attempts() {
+        let llm = ScriptedLlm::new(|kind, request, earlier| {
+            Ok(match kind {
+                Kind::Worker => signed(request),
+                Kind::Review => unmet_if(&request.prompt, "builds", "cargo build: error[E0425]"),
+                _ => agreeable(kind, request, earlier)?,
+            })
+        });
+        let (_dir, orchestrator, context) = setup(llm.clone(), true, 0);
+        context.lock().await.worker_models = vec!["cheap".into(), "middle".into(), "strong".into()];
+
+        let end = tokio::time::timeout(Duration::from_secs(20), orchestrator.run(&context, Hitl::Stdin))
+            .await
+            .expect("the run must terminate")
+            .unwrap();
+        assert_eq!(end, RunEnd::Finished);
+        assert_eq!(worker_models(&llm), ["cheap", "cheap", "middle", "middle"]);
+        assert!(matches!(status_of(&*context.lock().await, "TASK-1"), TaskStatus::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_model_that_becomes_unusable_is_retired_and_its_work_moves_on_without_losing_an_attempt() {
+        let llm = ScriptedLlm::new(|kind, request, earlier| match kind {
+            Kind::Worker if request.model == "free" => {
+                Err(LlmError::Other(anyhow!("ProviderError: {}", crate::llm::FREE_ALLOWANCE_USED_UP)))
+            }
+            _ => agreeable(kind, request, earlier),
+        });
+        let (_dir, orchestrator, context) = setup(llm.clone(), true, 50);
+        context.lock().await.worker_models = vec!["free".into(), "paid".into()];
+
+        assert_eq!(orchestrator.run(&context, Hitl::Stdin).await.unwrap(), RunEnd::Finished);
+        // Asked once, then left alone: the second task goes straight to the model that works.
+        assert_eq!(worker_models(&llm), ["free", "paid", "paid"]);
+        let ctx = context.lock().await;
+        assert_eq!(ctx.count_completed(), 2);
+        assert!(ctx.tasks.iter().all(|t| t.retries == 0));
+        assert!(ctx.is_retired("free") && !ctx.is_retired("paid"));
+        assert!(ctx.retired_models[0].1.contains("allowance for today is used up"));
+    }
+
+    /// Seen live: a correct review was overruled by the quote check four times.
+    /// Nothing was wrong with the work, so the model that did it must not be
+    /// marked down for it or have the task taken away.
+    #[tokio::test]
+    async fn a_review_that_is_merely_unproven_does_not_move_the_task_to_another_model() {
+        let invented = |prompt: &str| {
+            let findings: Vec<serde_json::Value> = items_in(prompt)
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    serde_json::json!({ "id": i + 1, "status": "met", "evidence": "it is all there",
+                                        "file": "src/lib.rs", "quote": "this line is not in the file at all" })
+                })
+                .collect();
+            serde_json::to_string(&findings).unwrap()
+        };
+        // Three reviews of two requests each (answer and correction) are unproven, then one is sound.
+        let llm = ScriptedLlm::new(move |kind, request, earlier| match kind {
+            Kind::Review if earlier < 6 => Ok(invented(&request.prompt)),
+            _ => agreeable(kind, request, earlier),
+        });
+        let (_dir, orchestrator, context) = setup(llm.clone(), true, 50);
+        context.lock().await.worker_models = vec!["cheap".into(), "strong".into()];
+
+        assert_eq!(orchestrator.run(&context, Hitl::Stdin).await.unwrap(), RunEnd::Finished);
+        assert_eq!(worker_models(&llm), ["cheap", "cheap", "cheap", "cheap", "cheap"]);
+        let ctx = context.lock().await;
+        assert_eq!(ctx.count_completed(), 2);
+        assert_eq!((ctx.model_usage["cheap"].passed, ctx.model_usage["cheap"].rejected), (2, 0));
     }
 
     #[tokio::test]

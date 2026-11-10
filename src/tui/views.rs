@@ -436,11 +436,13 @@ mod tests {
                 requirement: "Enter evaluates the expression".into(),
                 status: crate::context::FindingStatus::Unmet,
                 evidence: "only '=' is handled".into(),
+                overruled: false,
             },
             crate::context::Finding {
                 requirement: "Borders are cyan".into(),
                 status: crate::context::FindingStatus::CannotVerify,
                 evidence: "needs a terminal".into(),
+                overruled: false,
             },
         ]);
         let stats = render(&mut app, &ctx);

@@ -121,13 +121,21 @@ impl CheckItem {
 pub enum WorkerOutcome {
     Completed { summary: String, files: Vec<String>, new_tasks: Vec<TaskDef> },
     Failed { reason: String },
+    /// The model itself cannot be used (a dead key, a used-up allowance). The
+    /// task is not at fault, and trying the same model again will not help.
+    ModelUnavailable { reason: String },
 }
 
 #[derive(Debug, PartialEq)]
 pub enum ReviewVerdict {
     /// Nothing was found unmet. `notes` lists what the reviewer could not verify.
     Passed { notes: Vec<String> },
+    /// The reviewer found at least one item unmet.
     Rejected(String),
+    /// The reviewer found nothing unmet, but did not show its evidence for
+    /// some "met" answers, so they do not count. The work goes back, but
+    /// nothing has been found wrong with it.
+    Unproven(String),
 }
 
 /// Checked on every task, whatever its own criteria are. The flag says whether
@@ -319,6 +327,7 @@ pub fn parse_findings(reply: &str, items: &[CheckItem]) -> Result<Vec<Answer>, S
                 requirement: items[index].text.clone(),
                 status,
                 evidence: text(entry, "evidence").unwrap_or_default(),
+                overruled: false,
             },
             file: text(entry, "file"),
             quote: text(entry, "quote"),
@@ -424,6 +433,7 @@ pub fn audit(answers: Vec<Answer>, items: &[CheckItem], sandbox: &Sandbox) -> (V
                         };
                         problems.push((i, format!("Item {n}: you answered met, but {what}, or answer unmet.")));
                         finding.status = FindingStatus::Unmet;
+                        finding.overruled = true;
                         finding.evidence = format!(
                             "The reviewer called this met but could not quote code in the project that implements it. Its claim: {}",
                             if finding.evidence.is_empty() { "(none)" } else { &finding.evidence }
@@ -433,6 +443,7 @@ pub fn audit(answers: Vec<Answer>, items: &[CheckItem], sandbox: &Sandbox) -> (V
                 FindingStatus::Met if finding.evidence.is_empty() => {
                     problems.push((i, format!("Item {n}: you answered met without evidence. Give the command output that shows it, or answer unmet.")));
                     finding.status = FindingStatus::Unmet;
+                    finding.overruled = true;
                     finding.evidence = "The reviewer called this met but gave no evidence.".to_string();
                 }
                 FindingStatus::CannotVerify if item.decidable => {
@@ -536,6 +547,12 @@ pub async fn execute_task(
                      (The limit can be raised with --max-turns.)"
                 ),
             },
+            usage: TokenUsage::default(),
+            calls: 0,
+            reply: None,
+        },
+        Err(e) if is_permanent(&e.to_string()) => AgentRun {
+            outcome: WorkerOutcome::ModelUnavailable { reason: e.to_string() },
             usage: TokenUsage::default(),
             calls: 0,
             reply: None,
@@ -671,10 +688,13 @@ pub fn verdict_from(findings: &[Finding]) -> ReviewVerdict {
                 .collect(),
         }
     } else {
-        ReviewVerdict::Rejected(format!(
-            "The QA reviewer checked your work item by item. These are not met:\n{}",
-            unmet.join("\n")
-        ))
+        let feedback =
+            format!("The QA reviewer checked your work item by item. These are not met:\n{}", unmet.join("\n"));
+        if findings.iter().any(|f| f.status == FindingStatus::Unmet && !f.overruled) {
+            ReviewVerdict::Rejected(feedback)
+        } else {
+            ReviewVerdict::Unproven(feedback)
+        }
     }
 }
 
@@ -1045,6 +1065,7 @@ mod tests {
             requirement: "Enter evaluates the expression".into(),
             status,
             evidence: evidence.into(),
+            overruled: false,
         };
         assert_eq!(verdict_from(&[finding(FindingStatus::Met, "src/app.rs:40")]), ReviewVerdict::Passed { notes: vec![] });
 

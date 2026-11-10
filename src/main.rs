@@ -71,6 +71,12 @@ struct Args {
     #[arg(long)]
     review_model: Option<String>,
 
+    /// Models that may build, cheapest first, separated by commas. A task starts on the first
+    /// and moves to the next after two failed attempts, or at once if a model becomes unusable
+    /// (for example when a free allowance runs out). Without this, only --model builds
+    #[arg(long, value_delimiter = ',', value_name = "MODEL,MODEL")]
+    workers: Vec<String>,
+
     /// How many times unmet design requirements are turned into a fix task [default: 2]
     #[arg(long)]
     fix_rounds: Option<usize>,
@@ -178,7 +184,10 @@ async fn run() -> Result<ExitCode> {
     // Fail before touching the disk if the provider cannot be used at all.
     // (A resumed run takes its model from the saved state and is checked below.)
     if !args.resume {
-        check_credentials(&args.model.clone().unwrap_or_else(default_model))?;
+        match worker_pool(&args) {
+            Some(pool) => pool.iter().try_for_each(|model| check_credentials(model))?,
+            None => check_credentials(&args.model.clone().unwrap_or_else(default_model))?,
+        }
     }
 
     let sandbox = Sandbox::new(&args.output, Duration::from_secs(args.command_timeout.max(1)))
@@ -193,6 +202,9 @@ async fn run() -> Result<ExitCode> {
         ctx.working_directory = output_dir.clone();
         if let Some(model) = &args.model {
             ctx.model = model.clone();
+        }
+        if let Some(workers) = worker_pool(&args) {
+            ctx.worker_models = workers;
         }
         if let Some(max_steps) = args.max_steps {
             ctx.max_steps = max_steps;
@@ -218,8 +230,13 @@ async fn run() -> Result<ExitCode> {
             args.max_steps.unwrap_or(DEFAULT_MAX_STEPS),
             args.max_turns.unwrap_or(DEFAULT_MAX_TURNS).max(1),
             args.brave,
-            args.model.clone().unwrap_or_else(default_model),
+            // Without --model, planning falls to the first worker model.
+            args.model
+                .clone()
+                .or_else(|| worker_pool(&args).and_then(|pool| pool.first().cloned()))
+                .unwrap_or_else(default_model),
         );
+        ctx.worker_models = worker_pool(&args).unwrap_or_default();
         ctx.review_model = args.review_model.clone();
         ctx.fix_rounds = args.fix_rounds.unwrap_or(DEFAULT_FIX_ROUNDS);
         ctx.design_check_enabled = !args.skip_design_check;
@@ -228,6 +245,9 @@ async fn run() -> Result<ExitCode> {
 
     check_credentials(&context.model)?;
     check_credentials(context.reviewer_model())?;
+    for model in context.pool() {
+        check_credentials(model)?;
+    }
 
     let use_tui = !args.headless;
     if use_tui {
@@ -256,6 +276,13 @@ async fn run() -> Result<ExitCode> {
         );
     }
     tracing::info!("Clankistrator: model {}, output directory {}", context.model, output_dir.display());
+    if context.pool().len() > 1 {
+        tracing::info!(
+            "Clankistrator: worker models, cheapest first: {}. Reviews by {}",
+            context.pool().join(", "),
+            context.reviewer_model()
+        );
+    }
 
     let enclosing = sandbox.enclosing_projects();
     if !enclosing.is_empty() {
@@ -269,12 +296,29 @@ async fn run() -> Result<ExitCode> {
     }
 
     let llm = RigLlm { prompt_caching: !args.no_prompt_cache };
-    // One small request per model, so a mistyped model name stops the run here
-    // instead of after a worker has spent tokens on something nobody can review.
     let mut context = context;
-    if llm::uses_free_tier(&[context.model.as_str(), context.reviewer_model()]) {
+    let pool: Vec<String> = context.pool().iter().map(|m| m.to_string()).collect();
+    // Models the run cannot do without: the planner and the reviewer.
+    let required = [context.model.clone(), context.reviewer_model().to_string()];
+    let is_free = |model: &str| llm::uses_free_tier(&[model]);
+
+    if pool.iter().chain(&required).any(|model| is_free(model)) {
         let left = match llm::free_allowance().await {
-            Some(llm::FreeAllowance { remaining: 0, .. }) => bail!("{}", llm::FREE_ALLOWANCE_USED_UP),
+            Some(llm::FreeAllowance { remaining: 0, .. }) => {
+                // The free models are out for today. Go on without them if the run can.
+                let has_other_workers = pool.iter().any(|model| !is_free(model));
+                // The reviewer is always needed; the planner only while there is no plan yet.
+                let needed = is_free(context.reviewer_model())
+                    || (context.tasks.is_empty() && is_free(&context.model));
+                if !has_other_workers || needed {
+                    bail!("{}", llm::FREE_ALLOWANCE_USED_UP);
+                }
+                for model in pool.iter().filter(|model| is_free(model)) {
+                    context.retire_model(model, llm::FREE_ALLOWANCE_USED_UP);
+                }
+                "OpenRouter reports none of today's free-model requests left, so the free models sit this run out"
+                    .to_string()
+            }
             Some(allowance) => format!(
                 "OpenRouter reports {} of today's {} free-model requests left",
                 allowance.remaining, allowance.limit
@@ -283,14 +327,37 @@ async fn run() -> Result<ExitCode> {
         };
         tracing::warn!(
             "Clankistrator: using an OpenRouter free model. {left}. Every turn of an agent is one request; \
-             requests are spaced out to stay under 20 a minute. If the day's allowance runs out, the remaining \
-             tasks fail and the run can be continued later with --resume."
+             requests are spaced out to stay under 20 a minute. If the day's allowance runs out, work moves to the \
+             next worker model if there is one; otherwise the remaining tasks fail and the run can be continued \
+             later with --resume."
         );
     }
-    let used = probe::preflight(&llm, &[context.model.as_str(), context.reviewer_model()]).await?;
-    context.input_tokens += used.input_tokens;
-    context.cached_input_tokens += used.cached_input_tokens;
-    context.output_tokens += used.output_tokens;
+
+    // One small request per model, so a mistyped model name stops the run here
+    // instead of after a worker has spent tokens on something nobody can review.
+    let mut asked: Vec<&str> = Vec::new();
+    for model in required.iter().chain(&pool) {
+        if asked.contains(&model.as_str()) || context.is_retired(model) {
+            continue;
+        }
+        asked.push(model);
+        match probe::preflight(&llm, &[model.as_str()]).await {
+            Ok(used) => {
+                context.input_tokens += used.input_tokens;
+                context.cached_input_tokens += used.cached_input_tokens;
+                context.output_tokens += used.output_tokens;
+            }
+            // A worker model that does not answer is left out, as long as another one does.
+            Err(e) if !required.contains(model) => {
+                tracing::warn!("Clankistrator: leaving {model} out of this run: {e:#}");
+                context.retire_model(model, &format!("{e:#}"));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if context.usable_pool().is_empty() {
+        bail!("none of the worker models can be used");
+    }
 
     let context: SharedContext = Arc::new(Mutex::new(context));
     let orchestrator = Orchestrator::new(Arc::new(llm), design_content, sandbox);
@@ -330,6 +397,20 @@ async fn run_cli(context: SharedContext, orchestrator: Orchestrator) -> Result<E
         println!("{}: {} - {}", task.id, task.title, status);
     }
     println!("Model calls: {}, tokens: {}, steps: {}", ctx.llm_calls, ctx.token_summary(), ctx.steps_taken);
+    if ctx.model_usage.len() > 1 {
+        for (model, used) in &ctx.model_usage {
+            println!(
+                "  {model}: {} calls, tokens: {}; task attempts passed {}, failed {}",
+                used.calls,
+                format_tokens(used.input_tokens, used.cached_input_tokens, used.output_tokens),
+                used.passed,
+                used.rejected
+            );
+        }
+    }
+    for (model, reason) in &ctx.retired_models {
+        println!("  {model} was left out during this run: {reason}");
+    }
     print_free_tier_use().await;
     if let Some(findings) = &ctx.design_check {
         print_design_report(findings, false);
@@ -383,6 +464,17 @@ async fn run_cli(context: SharedContext, orchestrator: Orchestrator) -> Result<E
 }
 
 /// Print the result of a design check. `list_met` also lists what was found met.
+/// The models named with --workers, or `None` if the option was not given.
+fn worker_pool(args: &Args) -> Option<Vec<String>> {
+    let mut pool: Vec<String> = Vec::new();
+    for model in args.workers.iter().map(|m| m.trim()).filter(|m| !m.is_empty()) {
+        if !pool.iter().any(|known| known == model) {
+            pool.push(model.to_string());
+        }
+    }
+    (!pool.is_empty()).then_some(pool)
+}
+
 /// The free tier counts requests, not tokens, so say how many this run used.
 async fn print_free_tier_use() {
     let requests = llm::free_model_requests();

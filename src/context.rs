@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Directory inside the output directory where Clankistrator keeps its own state.
@@ -92,6 +92,13 @@ pub struct ProjectTask {
     /// What the reviewer could not verify; shown to the human who approves.
     #[serde(default)]
     pub review_notes: Vec<String>,
+    /// The model chosen for this task, if one was: by the advisor, or by
+    /// stepping up after failures. Otherwise the first usable worker model.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Failed attempts since this task was last given a different model.
+    #[serde(default)]
+    pub failures_on_model: u32,
 }
 
 impl ProjectTask {
@@ -108,6 +115,8 @@ impl ProjectTask {
             files: Vec::new(),
             acceptance_criteria: def.acceptance_criteria,
             review_notes: Vec::new(),
+            model: def.model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty()),
+            failures_on_model: 0,
         }
     }
 }
@@ -127,6 +136,11 @@ pub struct Finding {
     pub requirement: String,
     pub status: FindingStatus,
     pub evidence: String,
+    /// The reviewer called this met and a mechanical check turned it into
+    /// unmet, because the reviewer did not show its evidence. That is a doubt
+    /// about the review, not a defect anyone found in the work.
+    #[serde(default)]
+    pub overruled: bool,
 }
 
 impl Finding {
@@ -152,7 +166,27 @@ pub struct TaskDef {
     pub dependencies: Vec<String>,
     #[serde(default)]
     pub acceptance_criteria: Vec<String>,
+    /// The worker model this task should go to, when the planner chose one.
+    #[serde(default)]
+    pub model: Option<String>,
 }
+
+/// What one model did in a run: what it cost, and how its work fared.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ModelUsage {
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    /// Task attempts by this model that passed review.
+    pub passed: u32,
+    /// Task attempts by this model that failed or that the reviewer rejected.
+    pub rejected: u32,
+}
+
+/// After this many failed attempts on one model, a task moves to the next
+/// worker model, if there is one.
+pub const STEP_UP_AFTER: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub enum RunPhase {
@@ -231,6 +265,16 @@ pub struct ProjectContext {
     /// Why the design check could not be completed, if it failed.
     #[serde(default)]
     pub design_check_error: Option<String>,
+    /// The models that may build, cheapest first. Empty means only `model`.
+    #[serde(default)]
+    pub worker_models: Vec<String>,
+    /// Worker models found unusable during this run (a dead key, a used-up
+    /// allowance), with the reason. Not saved: tomorrow they may work again.
+    #[serde(skip)]
+    pub retired_models: Vec<(String, String)>,
+    /// Calls, tokens and results per model.
+    #[serde(default)]
+    pub model_usage: BTreeMap<String, ModelUsage>,
 }
 
 fn enabled() -> bool {
@@ -285,7 +329,57 @@ impl ProjectContext {
             design_check: None,
             design_checked_task_count: 0,
             design_check_error: None,
+            worker_models: Vec::new(),
+            retired_models: Vec::new(),
+            model_usage: BTreeMap::new(),
         }
+    }
+
+    /// The worker models in the order given (cheapest first).
+    pub fn pool(&self) -> Vec<&str> {
+        if self.worker_models.is_empty() {
+            vec![self.model.as_str()]
+        } else {
+            self.worker_models.iter().map(String::as_str).collect()
+        }
+    }
+
+    pub fn is_retired(&self, model: &str) -> bool {
+        self.retired_models.iter().any(|(retired, _)| retired == model)
+    }
+
+    /// The worker models that can still be used in this run.
+    pub fn usable_pool(&self) -> Vec<&str> {
+        self.pool().into_iter().filter(|model| !self.is_retired(model)).collect()
+    }
+
+    /// Stop using a worker model for the rest of this run.
+    pub fn retire_model(&mut self, model: &str, reason: &str) {
+        if !self.is_retired(model) {
+            self.retired_models.push((model.to_string(), reason.to_string()));
+        }
+    }
+
+    /// The model a task's next attempt runs on: the one chosen for it if that
+    /// is still usable, otherwise the first usable worker model.
+    pub fn worker_model_for(&self, task: &ProjectTask) -> String {
+        let usable = self.usable_pool();
+        match &task.model {
+            Some(model) if usable.contains(&model.as_str()) => model.clone(),
+            _ => usable.first().copied().unwrap_or(&self.model).to_string(),
+        }
+    }
+
+    /// The next usable worker model after `current` in the pool's order.
+    pub fn next_model_up(&self, current: &str) -> Option<String> {
+        let pool = self.pool();
+        let at = pool.iter().position(|model| *model == current)?;
+        pool[at + 1..].iter().find(|model| !self.is_retired(model)).map(|model| model.to_string())
+    }
+
+    /// The strongest usable worker model: the last one in the pool's order.
+    pub fn strongest_model(&self) -> String {
+        self.usable_pool().last().copied().unwrap_or(&self.model).to_string()
     }
 
     /// Whether the finished project still has to be checked against the design.
@@ -598,6 +692,8 @@ pub(crate) mod tests {
             files: vec![],
             acceptance_criteria: vec![],
             review_notes: vec![],
+            model: None,
+            failures_on_model: 0,
         }
     }
 
