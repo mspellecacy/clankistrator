@@ -134,7 +134,7 @@ The run summary lists calls, tokens and passed and failed attempts per model, so
 
 Not built: a tool that lets a worker ask the advisor a question in the middle of its own attempt. The advisor is consulted by Clankistrator at fixed points, not by the workers.
 
-Run live so far: planning and assignment (through the MCP `plan_tasks` tool). Stepping up, fallback and advice are covered by tests against scripted models and have not yet been seen in a real run.
+Run live so far: a full build of the bundled calculator design with one advisor and two worker models, in which the advisor planned two tasks and gave one to each worker, reviewed them, and the fix task from the design check went to the stronger worker. Nothing failed review in that run, so stepping up, fallback and advice after a failure are still covered only by tests against scripted models and have not been seen in a real run.
 
 #### Checking that a model works
 
