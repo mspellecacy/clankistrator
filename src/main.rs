@@ -1,170 +1,413 @@
-pub mod context;
 pub mod agents;
-pub mod orchestrator;
-pub mod tools;
-pub mod parser;
-pub mod tui;
+pub mod context;
+pub mod llm;
 pub mod mcp;
+pub mod orchestrator;
+pub mod parser;
+pub mod tools;
+pub mod tui;
 
 use std::path::PathBuf;
+use std::process::ExitCode;
+use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use std::time::Duration;
+
+use anyhow::{Context as _, Result, bail};
 use clap::Parser;
-use crate::context::{ProjectContext, TaskStatus};
-use crate::orchestrator::Orchestrator;
-use crate::tui::App;
-use anyhow::Result;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::agents::AgentSettings;
+use crate::context::{DEFAULT_FIX_ROUNDS, Finding, FindingStatus, ProjectContext, TaskStatus};
+use crate::llm::{RigLlm, check_credentials};
+use crate::orchestrator::{Hitl, Orchestrator, PROVIDER_RETRY_DELAY, RunEnd, SharedContext, check_design};
+use crate::tools::Sandbox;
+use crate::tui::App;
+
+const FALLBACK_MODEL: &str = "gpt-4o";
+const DEFAULT_MAX_STEPS: usize = 50;
+const DEFAULT_MAX_TURNS: usize = 40;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// Markdown design document to implement
     #[arg(short, long, default_value = "design.md")]
     design: PathBuf,
 
-    #[arg(short, long, default_value = "output")]
+    /// Directory the agents work in; their file tools cannot reach outside it
+    #[arg(short, long, env = "WORKING_DIRECTORY", default_value = "output")]
     output: PathBuf,
 
-    #[arg(short, long, default_value = "gpt-4o")]
-    model: String,
+    /// Model, optionally with a provider prefix (openai:, anthropic:, gemini:, ollama:).
+    /// Defaults to $DEFAULT_MODEL, then gpt-4o
+    #[arg(short, long)]
+    model: Option<String>,
 
-    #[arg(long, default_value_t = false)]
+    /// Plain log output instead of the TUI; approvals are asked on stdin
+    #[arg(long)]
     headless: bool,
 
-    #[arg(short, long, default_value_t = false)]
+    /// Approve tasks automatically once they pass review
+    #[arg(short, long)]
     brave: bool,
 
-    #[arg(short = 'S', long, default_value_t = 50, help = "Maximum orchestration steps (0 for unlimited)")]
-    max_steps: usize,
+    /// Maximum orchestration steps, counting only passes that ran or reviewed a task (0 = unlimited) [default: 50]
+    #[arg(short = 'S', long)]
+    max_steps: Option<usize>,
 
-    #[arg(long, help = "Run Clankistrator as an MCP server on stdio")]
+    /// Maximum model turns (tool-call rounds) a worker gets per task attempt [default: 40]
+    #[arg(long)]
+    max_turns: Option<usize>,
+
+    /// Seconds a command started by an agent may run before it is killed
+    #[arg(long, default_value_t = 300)]
+    command_timeout: u64,
+
+    /// Model for reviews and the design check, if it should differ from --model
+    #[arg(long)]
+    review_model: Option<String>,
+
+    /// How many times unmet design requirements are turned into a fix task [default: 2]
+    #[arg(long)]
+    fix_rounds: Option<usize>,
+
+    /// Do not check the finished project against the design document
+    #[arg(long)]
+    skip_design_check: bool,
+
+    /// Only check the project already in --output against --design, and report. Runs no tasks
+    #[arg(long, conflicts_with_all = ["resume", "mcp_server"])]
+    check: bool,
+
+    /// Continue the run saved in the output directory instead of starting over
+    #[arg(long)]
+    resume: bool,
+
+    /// Run as an MCP server on stdio instead of orchestrating
+    #[arg(long)]
     mcp_server: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn default_model() -> String {
+    std::env::var("DEFAULT_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| FALLBACK_MODEL.to_string())
+}
+
+fn log_level() -> String {
+    std::env::var("LOG_LEVEL").ok().filter(|l| !l.trim().is_empty()).unwrap_or_else(|| "info".to_string())
+}
+
+/// `RUST_LOG` wins if set; otherwise `LOG_LEVEL` (default: info). rig logs every
+/// tool call with its full arguments and result at info level, which buries
+/// everything else, so it is held at warn unless `RUST_LOG` asks for more.
+fn env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .or_else(|_| tracing_subscriber::EnvFilter::try_new(format!("{},rig=warn", log_level())))
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,rig=warn"))
+}
+
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("Error: could not start the async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = match runtime.block_on(run()) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            ExitCode::FAILURE
+        }
+    };
+    // Leave promptly: do not wait for a blocked stdin read or for agents that
+    // were cut short, but do not leave their commands running either.
+    tools::command_executor::kill_running_commands();
+    runtime.shutdown_background();
+    code
+}
+
+async fn run() -> Result<ExitCode> {
     dotenvy::from_filename(".env.local").ok();
     dotenvy::dotenv().ok();
 
     let args = Args::parse();
-    let use_tui = !args.headless;
 
     if args.mcp_server {
-        let server = crate::mcp::McpServer::new();
-        return server.run().await;
+        // stdout carries the protocol, so logs go to stderr.
+        tracing_subscriber::fmt().with_env_filter(env_filter()).with_writer(std::io::stderr).init();
+        let server = mcp::McpServer::new(Arc::new(RigLlm), args.model.unwrap_or_else(default_model));
+        server.run().await?;
+        return Ok(ExitCode::SUCCESS);
     }
-    
-    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive(tracing_subscriber::filter::LevelFilter::INFO.into());
 
+    if !args.design.is_file() {
+        bail!("design file not found: {}", args.design.display());
+    }
+    let design_content = std::fs::read_to_string(&args.design)
+        .with_context(|| format!("reading {}", args.design.display()))?;
+    if design_content.trim().is_empty() {
+        bail!("design file is empty: {}", args.design.display());
+    }
+
+    if args.check {
+        return run_check(&args, design_content).await;
+    }
+
+    // Fail before touching the disk if the provider cannot be used at all.
+    // (A resumed run takes its model from the saved state and is checked below.)
+    if !args.resume {
+        check_credentials(&args.model.clone().unwrap_or_else(default_model))?;
+    }
+
+    let sandbox = Sandbox::new(&args.output, Duration::from_secs(args.command_timeout.max(1)))
+        .with_context(|| format!("preparing output directory {}", args.output.display()))?;
+    let output_dir = sandbox.root().to_path_buf();
+    let state_path = ProjectContext::state_path(&output_dir);
+
+    let context = if args.resume {
+        let mut ctx = ProjectContext::load(&output_dir)
+            .context("--resume needs the state of an earlier run in the output directory")?;
+        ctx.prepare_resume();
+        ctx.working_directory = output_dir.clone();
+        if let Some(model) = &args.model {
+            ctx.model = model.clone();
+        }
+        if let Some(max_steps) = args.max_steps {
+            ctx.max_steps = max_steps;
+        }
+        if let Some(max_turns) = args.max_turns {
+            ctx.max_turns = max_turns;
+        }
+        ctx.brave_mode |= args.brave;
+        if args.review_model.is_some() {
+            ctx.review_model = args.review_model.clone();
+        }
+        if let Some(fix_rounds) = args.fix_rounds {
+            ctx.fix_rounds = fix_rounds;
+        }
+        ctx.design_check_enabled &= !args.skip_design_check;
+        ctx
+    } else {
+        let project_name =
+            args.design.file_stem().and_then(|s| s.to_str()).unwrap_or("project").to_string();
+        let mut ctx = ProjectContext::new(
+            project_name,
+            output_dir.clone(),
+            args.max_steps.unwrap_or(DEFAULT_MAX_STEPS),
+            args.max_turns.unwrap_or(DEFAULT_MAX_TURNS).max(1),
+            args.brave,
+            args.model.clone().unwrap_or_else(default_model),
+        );
+        ctx.review_model = args.review_model.clone();
+        ctx.fix_rounds = args.fix_rounds.unwrap_or(DEFAULT_FIX_ROUNDS);
+        ctx.design_check_enabled = !args.skip_design_check;
+        ctx
+    };
+
+    check_credentials(&context.model)?;
+    check_credentials(context.reviewer_model())?;
+
+    let use_tui = !args.headless;
     if use_tui {
-        let _ = tui_logger::init_logger(log::LevelFilter::Info);
+        let level = log::LevelFilter::from_str(&log_level()).unwrap_or(log::LevelFilter::Info);
+        let _ = tui_logger::init_logger(level);
         let _ = tracing_subscriber::registry()
             .with(tui_logger::TuiTracingSubscriberLayer)
-            .with(env_filter)
+            .with(env_filter())
             .try_init();
-        tui_logger::set_default_level(log::LevelFilter::Info);
-        tracing::info!("TUI Mode initialized");
+        tui_logger::set_default_level(level);
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .init();
+        tracing_subscriber::fmt().with_env_filter(env_filter()).init();
     }
 
-    if !args.design.exists() {
-        anyhow::bail!("Design file not found: {:?}", args.design);
+    if args.resume {
+        tracing::info!(
+            "Clankistrator: resuming {} ({} of {} tasks completed)",
+            context.project_name,
+            context.count_completed(),
+            context.tasks.len()
+        );
+    } else if state_path.exists() {
+        tracing::warn!(
+            "Clankistrator: {} holds an earlier run, which this run replaces. Use --resume to continue it instead.",
+            output_dir.display()
+        );
+    }
+    tracing::info!("Clankistrator: model {}, output directory {}", context.model, output_dir.display());
+
+    let enclosing = sandbox.enclosing_projects();
+    if !enclosing.is_empty() {
+        let found: Vec<String> = enclosing.iter().map(|p| p.display().to_string()).collect();
+        tracing::warn!(
+            "Clankistrator: the output directory is inside another project ({}). Build tools and version control \
+             search parent directories, so an agent's command can end up acting on that project. cargo and git are \
+             guarded against this; other tools are not. An output directory outside any project is safer.",
+            found.join(", ")
+        );
     }
 
-    if !args.output.exists() {
-        std::fs::create_dir_all(&args.output)?;
-    }
-
-    let design_content = std::fs::read_to_string(&args.design)?;
-    let project_name = args.design
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("New Project")
-        .to_string();
-
-    let context = Arc::new(Mutex::new(ProjectContext::new(project_name, args.output.clone(), args.max_steps, args.brave, args.model.clone())));
-    let orchestrator = Orchestrator::new(args.model, design_content.clone(), use_tui, args.max_steps);
+    let context: SharedContext = Arc::new(Mutex::new(context));
+    let orchestrator = Orchestrator::new(Arc::new(RigLlm), design_content, sandbox);
 
     if use_tui {
-        run_tui(context, orchestrator, design_content, args.max_steps).await?;
+        run_tui(context, orchestrator).await?;
+        Ok(ExitCode::SUCCESS)
     } else {
-        run_cli(context, orchestrator, design_content, args.max_steps).await?;
+        run_cli(context, orchestrator).await
     }
-
-    Ok(())
 }
 
-async fn run_cli(context: Arc<Mutex<ProjectContext>>, orchestrator: Orchestrator, design_content: String, max_steps: usize) -> Result<()> {
-    tracing::info!("Clankistrator: Starting orchestration for project {:?}", context.lock().await.project_name);
-
-    // 1. Bootstrap Phase
-    let initial_tasks = orchestrator.bootstrap_project(&design_content).await?;
-    {
-        let mut ctx = context.lock().await;
-        ctx.tasks = initial_tasks;
-        ctx.token_usage += 1000;
-        ctx.total_cost += 0.02;
-    }
-
-    if context.lock().await.tasks.is_empty() {
-        tracing::warn!("Clankistrator: No tasks were generated from the design document. Bailing out.");
-        return Ok(());
-    }
-
-    tracing::info!("Clankistrator: Bootstrapped with {} initial tasks", context.lock().await.tasks.len());
-
-    // 2. Execution Phase
-    let mut i = 1;
-    loop {
-        if max_steps != 0 && i > max_steps {
-            tracing::info!("Clankistrator: Reached maximum steps ({})", max_steps);
-            break;
+async fn run_cli(context: SharedContext, orchestrator: Orchestrator) -> Result<ExitCode> {
+    let outcome = tokio::select! {
+        outcome = orchestrator.run(&context, Hitl::Stdin) => outcome,
+        _ = tokio::signal::ctrl_c() => {
+            tools::command_executor::kill_running_commands();
+            let ctx = context.lock().await;
+            let _ = ctx.save();
+            eprintln!("\nInterrupted. Progress is saved; rerun with --resume to continue.");
+            return Ok(ExitCode::from(130));
         }
-        tracing::info!("Clankistrator: Starting iteration {}", i);
-        orchestrator.run_iteration(Arc::clone(&context)).await?;
-        
-        let ctx = context.lock().await;
-        let completed_count = ctx.tasks.iter().filter(|t| matches!(t.status, TaskStatus::Completed { .. })).count();
-        let failed_count = ctx.tasks.iter().filter(|t| matches!(t.status, TaskStatus::Failed { .. })).count();
-        
-        if completed_count + failed_count == ctx.tasks.len() && !ctx.tasks.is_empty() {
-            if failed_count > 0 {
-                tracing::warn!("Clankistrator: Finished with {} completed and {} failed tasks.", completed_count, failed_count);
-            } else {
-                tracing::info!("Clankistrator: All tasks completed!");
-            }
-            break;
-        }
-        i += 1;
-    }
+    };
 
     let ctx = context.lock().await;
     println!("\n--- ORCHESTRATION SUMMARY ---");
     println!("Project: {}", ctx.project_name);
+    println!("Output:  {}", ctx.working_directory.display());
     for task in &ctx.tasks {
         let status = match &task.status {
-            TaskStatus::Completed { .. } => "✅ Completed",
-            TaskStatus::Failed { error } => &format!("❌ Failed: {}", error),
-            TaskStatus::Pending => "⏳ Pending",
-            TaskStatus::InProgress(_) => "🔄 In Progress",
-            TaskStatus::ReadyForReview { .. } => "👀 Ready for Review",
-            TaskStatus::Reviewing(_) => "🔍 Reviewing",
-            TaskStatus::RequiresHumanApproval { .. } => "👤 Waiting for Approval",
+            TaskStatus::Completed { .. } => "✅ Completed".to_string(),
+            TaskStatus::Failed { error } => {
+                format!("❌ Failed: {}", error.lines().next().unwrap_or_default())
+            }
+            other => format!("⏳ {}", other.label()),
         };
-        println!("Task {}: {} - {}", task.id, task.title, status);
+        println!("{}: {} - {}", task.id, task.title, status);
+    }
+    println!(
+        "Model calls: {}, tokens: {} in / {} out, steps: {}",
+        ctx.llm_calls, ctx.input_tokens, ctx.output_tokens, ctx.steps_taken
+    );
+    if let Some(findings) = &ctx.design_check {
+        print_design_report(findings, false);
     }
 
-    Ok(())
+    match outcome {
+        Err(e) => Err(e),
+        Ok(RunEnd::StepLimit) => {
+            println!("Stopped at the step limit ({}). Rerun with --resume to continue.", ctx.max_steps);
+            Ok(ExitCode::from(2))
+        }
+        Ok(RunEnd::Finished) if ctx.count_failed() > 0 => {
+            println!(
+                "{} of {} tasks failed. Rerun with --resume to retry them.",
+                ctx.count_failed(),
+                ctx.tasks.len()
+            );
+            Ok(ExitCode::FAILURE)
+        }
+        Ok(RunEnd::Finished) if !ctx.unmet_requirements().is_empty() => {
+            println!(
+                "Every task completed, but {} design requirement(s) are still unmet after {} fix round(s). \
+                 The project does not implement the design yet. Rerun with --resume to try further fix rounds.",
+                ctx.unmet_requirements().len(),
+                ctx.fix_rounds_done
+            );
+            Ok(ExitCode::FAILURE)
+        }
+        Ok(RunEnd::Finished) if ctx.design_check_error.is_some() => {
+            println!(
+                "Every task completed, but the project could not be checked against the design: {}",
+                ctx.design_check_error.as_deref().unwrap_or_default()
+            );
+            Ok(ExitCode::FAILURE)
+        }
+        Ok(RunEnd::Finished) if !ctx.design_check_enabled => {
+            println!("All tasks completed. The project was not checked against the design (--skip-design-check).");
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(RunEnd::Finished) => {
+            println!("All tasks completed, and the design check found nothing unmet.");
+            Ok(ExitCode::SUCCESS)
+        }
+    }
 }
 
-async fn run_tui(context: Arc<Mutex<ProjectContext>>, orchestrator: Orchestrator, design_content: String, max_steps: usize) -> Result<()> {
-    // Setup terminal
+/// Print the result of a design check. `list_met` also lists what was found met.
+fn print_design_report(findings: &[Finding], list_met: bool) {
+    let of = |status: FindingStatus| findings.iter().filter(move |f| f.status == status).collect::<Vec<_>>();
+    let (met, unmet, unverified) =
+        (of(FindingStatus::Met), of(FindingStatus::Unmet), of(FindingStatus::CannotVerify));
+    println!(
+        "\n--- DESIGN CHECK: {} met, {} unmet, {} could not be verified ---",
+        met.len(),
+        unmet.len(),
+        unverified.len()
+    );
+    let section = |title: &str, items: &[&Finding]| {
+        if !items.is_empty() {
+            println!("\n{title}:");
+            for finding in items {
+                println!("{}", finding.line());
+            }
+        }
+    };
+    section("UNMET", &unmet);
+    section("COULD NOT BE VERIFIED (check these yourself)", &unverified);
+    if list_met {
+        section("MET", &met);
+    }
+}
+
+/// `--check`: judge the project already in the output directory against the
+/// design, print the findings, and change nothing.
+async fn run_check(args: &Args, design_content: String) -> Result<ExitCode> {
+    if !args.output.is_dir() {
+        bail!("--check needs an existing project directory, but {} is not one", args.output.display());
+    }
+    let model = args.model.clone().unwrap_or_else(default_model);
+    let review_model = args.review_model.clone().unwrap_or_else(|| model.clone());
+    check_credentials(&review_model)?;
+    tracing_subscriber::fmt().with_env_filter(env_filter()).init();
+
+    let sandbox = Sandbox::new(&args.output, Duration::from_secs(args.command_timeout.max(1)))?;
+    tracing::info!("Clankistrator: checking {} with model {review_model}", sandbox.root().display());
+    let settings = AgentSettings {
+        model,
+        review_model,
+        design_doc: design_content,
+        sandbox,
+        max_turns: args.max_turns.unwrap_or(DEFAULT_MAX_TURNS),
+        plan: String::new(),
+        retry_delay: PROVIDER_RETRY_DELAY,
+    };
+    let check = tokio::select! {
+        check = check_design(&RigLlm, &[], &settings) => check?,
+        _ = tokio::signal::ctrl_c() => return Ok(ExitCode::from(130)),
+    };
+
+    print_design_report(&check.findings, true);
+    println!(
+        "\nModel calls: {}, tokens: {} in / {} out",
+        check.calls, check.usage.input_tokens, check.usage.output_tokens
+    );
+    let unmet = check.findings.iter().filter(|f| f.status == FindingStatus::Unmet).count();
+    if unmet == 0 {
+        println!("Nothing was found unmet.");
+        Ok(ExitCode::SUCCESS)
+    } else {
+        println!("{unmet} requirement(s) are unmet.");
+        Ok(ExitCode::FAILURE)
+    }
+}
+
+async fn run_tui(context: SharedContext, orchestrator: Orchestrator) -> Result<()> {
     struct Cleanup;
     impl Drop for Cleanup {
         fn drop(&mut self) {
@@ -172,94 +415,80 @@ async fn run_tui(context: Arc<Mutex<ProjectContext>>, orchestrator: Orchestrator
             let _ = crossterm::execute!(
                 std::io::stdout(),
                 crossterm::terminal::LeaveAlternateScreen,
-                crossterm::event::DisableMouseCapture,
                 crossterm::cursor::Show
             );
         }
     }
 
-    let _cleanup = Cleanup;
-
     crossterm::terminal::enable_raw_mode()?;
+    let _cleanup = Cleanup;
     let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
+    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
     let mut app = App::new(Arc::clone(&context));
 
-    // Spawn orchestrator thread
-    let ctx_clone = Arc::clone(&context);
-    tokio::spawn(async move {
-        // Bootstrap
-        match orchestrator.bootstrap_project(&design_content).await {
-            Ok(tasks) => {
-                let mut ctx = ctx_clone.lock().await;
-                ctx.tasks = tasks;
-                ctx.token_usage += 1000;
-                ctx.total_cost += 0.02;
-            }
-            Err(e) => {
-                tracing::error!("Orchestrator bootstrap failed: {}", e);
-                return;
-            }
-        }
-
-        // Execution loop
-        let mut i = 1;
-        loop {
-            if max_steps != 0 && i > max_steps {
-                tracing::info!("Orchestrator: Reached maximum steps ({}). Execution loop ending.", max_steps);
-                break;
-            }
-
-            // Check if all completed or failed
-            {
-                let ctx = ctx_clone.lock().await;
-                let completed = ctx.tasks.iter().filter(|t| matches!(t.status, TaskStatus::Completed { .. })).count();
-                let failed = ctx.tasks.iter().filter(|t| matches!(t.status, TaskStatus::Failed { .. })).count();
-                
-                if !ctx.tasks.is_empty() && completed + failed == ctx.tasks.len() {
-                    if failed > 0 {
-                        tracing::warn!("Orchestrator: Finished with {} completed and {} failed tasks.", completed, failed);
-                    } else {
-                        tracing::info!("Orchestrator: All tasks completed. Execution loop ending.");
-                    }
-                    break;
+    // The orchestrator runs alongside the UI and talks to it through the shared
+    // context. Aborting it on exit kills any command an agent has running.
+    let run_context = Arc::clone(&context);
+    let orchestration = tokio::spawn(async move {
+        match orchestrator.run(&run_context, Hitl::External).await {
+            Ok(RunEnd::Finished) => {
+                let ctx = run_context.lock().await;
+                tracing::info!(
+                    "Orchestrator: finished, {} completed and {} failed. Press q to quit.",
+                    ctx.count_completed(),
+                    ctx.count_failed()
+                );
+                if !ctx.unmet_requirements().is_empty() {
+                    tracing::error!(
+                        "Orchestrator: {} design requirement(s) are still unmet; see the Stats tab.",
+                        ctx.unmet_requirements().len()
+                    );
+                } else if let Some(error) = &ctx.design_check_error {
+                    tracing::error!("Orchestrator: the project could not be checked against the design: {error}");
                 }
             }
-
-            // Run iteration
-            if let Err(e) = orchestrator.run_iteration(Arc::clone(&ctx_clone)).await {
-                tracing::error!("Orchestrator error: {}", e);
-            }
-            
-            i += 1;
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(RunEnd::StepLimit) => tracing::warn!("Orchestrator: stopped at the step limit."),
+            Err(e) => tracing::error!("Orchestrator stopped: {e:#}"),
         }
     });
 
-    // TUI Event loop
-    let mut event_reader = crossterm::event::EventStream::new();
-    let mut heartbeat_timer = tokio::time::interval(Duration::from_secs(5));
+    let mut events = crossterm::event::EventStream::new();
+    let mut redraw = tokio::time::interval(Duration::from_millis(250));
     while app.running {
-        // Draw the current state
         {
-            let mut ctx = context.lock().await;
-            terminal.draw(|f| {
-                crate::tui::views::draw(f, &mut app, &mut ctx);
-            })?;
+            let ctx = context.lock().await;
+            terminal.draw(|f| crate::tui::views::draw(f, &mut app, &ctx))?;
         }
 
         tokio::select! {
-            Some(Ok(event)) = event_reader.next() => {
-                app.handle_event(event).await?;
-            }
-            _ = heartbeat_timer.tick() => {
-                tracing::info!("TUI Loop heartbeat");
-            }
+            event = events.next() => match event {
+                Some(Ok(event)) => app.handle_event(event).await?,
+                Some(Err(e)) => bail!("terminal input failed: {e}"),
+                None => break,
+            },
+            _ = redraw.tick() => {}
         }
     }
 
+    orchestration.abort();
+    let _ = orchestration.await;
+    tools::command_executor::kill_running_commands();
+    let unfinished = {
+        let mut ctx = context.lock().await;
+        let unfinished = !ctx.all_terminal();
+        if unfinished {
+            ctx.phase = context::RunPhase::Starting;
+        }
+        let _ = ctx.save();
+        unfinished
+    };
+    drop(terminal);
+    drop(_cleanup);
+    if unfinished {
+        println!("Stopped before all tasks finished. Progress is saved; rerun with --resume to continue.");
+    }
     Ok(())
 }

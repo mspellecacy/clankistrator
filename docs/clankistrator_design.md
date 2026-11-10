@@ -1,5 +1,7 @@
 # Clankistrator: AI Orchestration Framework
 
+> This is the original design document and build log, kept for history. Parts of it describe plans or early stubs that no longer exist (vector-store RAG, cost estimates, the Critic agent). The README describes what the program does today.
+
 Clankistrator is a high-performance, type-safe Rust framework for multi-agent AI orchestration. It decomposes high-level design documents (Markdown) into actionable project tasks, which are then assigned to and executed by specialized AI agents.
 
 ## 1. Vision & Core Objectives

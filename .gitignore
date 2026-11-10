@@ -5,3 +5,7 @@
 !.env.example
 /test_app/
 /.junie/
+
+# Default locations for generated projects
+/output/
+/implementation/
