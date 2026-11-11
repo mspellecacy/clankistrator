@@ -22,9 +22,9 @@ Output ONLY the raw JSON list, with no commentary and no markdown fences.
 pub const WORKER_MODELS_INSTRUCTIONS: &str = r#"
 # Worker models
 
-Each task is carried out by one of the models below, which are listed from cheapest to most capable. Give every task a "model" field naming the model that should do it, written exactly as it is written here.
+Each task is carried out by one of the models below, which are listed from cheapest to most capable. Give every task a "model" field naming the model that should do it, written exactly as it is written here, and a "model_reason" field saying in one short sentence why that model and not a cheaper one.
 
-Choose the cheapest model that can be expected to do the task well. Mechanical work with an obvious result (creating the project, configuration, a small well-specified function) suits the cheapest model. Work where a subtle mistake is likely (parsing, state machines, input handling, terminal or network setup, anything the rest of the project depends on) suits a more capable one. A task that fails twice on its model is moved to the next model automatically, so do not pick the most capable model out of caution alone. A model with a limited number of requests cannot do everything: count roughly what your plan would need from it and give it only what fits.
+Choose the cheapest model that can be expected to do the task well. Mechanical work with an obvious result (creating the project, configuration, a small well-specified function) suits the cheapest model. Work where a subtle mistake is likely (parsing, state machines, input handling, terminal or network setup, anything the rest of the project depends on) suits a more capable one. A task that fails twice on its model is moved to the next model automatically, so do not pick the most capable model out of caution alone. Where two models would do a task equally well, do not give every task to the same one: spread the tasks between them, and prefer to have models from different providers take part. A model with a limited number of requests cannot do everything: count roughly what your plan would need from it and give it only what fits.
 
 What is known about the models:
 "#;

@@ -201,6 +201,7 @@ impl McpServer {
                     "dependencies": t.dependencies,
                     "acceptance_criteria": t.acceptance_criteria,
                     "model": t.model,
+                    "model_reason": t.model_reason,
                 })
             })
             .collect();

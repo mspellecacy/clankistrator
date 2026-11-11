@@ -189,7 +189,12 @@ pub async fn plan_tasks(
                 for task in &mut tasks {
                     match &task.model {
                         Some(chosen) if workers.models.contains(chosen) => {
-                            tracing::info!("Planner: {} ({}) goes to {chosen}", task.id, task.title);
+                            tracing::info!(
+                                "Planner: {} ({}) goes to {chosen}{}",
+                                task.id,
+                                task.title,
+                                task.model_reason.as_deref().map(|why| format!(": {why}")).unwrap_or_default()
+                            );
                         }
                         Some(unknown) => {
                             // Not worth another planning call: the default order applies.
@@ -855,6 +860,7 @@ impl Orchestrator {
                         // These are what the earlier work missed, so they go to the
                         // strongest worker model there is.
                         model: if ctx.pool().len() > 1 { ctx.strongest_model() } else { None },
+                        model_reason: Some("fix tasks go to the most capable worker model".to_string()),
                     };
                     ctx.tasks.push(ProjectTask::new(id, def));
                 } else {

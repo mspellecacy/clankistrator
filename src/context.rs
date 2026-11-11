@@ -113,6 +113,9 @@ pub struct ProjectTask {
     /// The model that made, or is making, the latest attempt.
     #[serde(default)]
     pub attempt_model: Option<String>,
+    /// Why the planner gave the task to its model, in the planner's words.
+    #[serde(default)]
+    pub model_reason: Option<String>,
 }
 
 impl ProjectTask {
@@ -130,6 +133,7 @@ impl ProjectTask {
             acceptance_criteria: def.acceptance_criteria,
             review_notes: Vec::new(),
             model: def.model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty()),
+            model_reason: def.model_reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty()),
             failures_on_model: 0,
             advice_wanted_after: None,
             consults: 0,
@@ -187,6 +191,9 @@ pub struct TaskDef {
     /// The worker model this task should go to, when the planner chose one.
     #[serde(default)]
     pub model: Option<String>,
+    /// The planner's reason for that choice, in a sentence.
+    #[serde(default)]
+    pub model_reason: Option<String>,
 }
 
 /// What one model did in a run: what it cost, and how its work fared.
@@ -776,6 +783,7 @@ pub(crate) mod tests {
             consults: 0,
             advice: None,
             attempt_model: None,
+            model_reason: None,
         }
     }
 
