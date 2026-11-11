@@ -851,8 +851,14 @@ pub async fn check_project(
         The project in the project directory is supposed to implement the design document. \
         Check it against every item below.\n"
         .to_string();
-    tracing::info!("Design check: verifying {} requirements", requirements.len());
-    verify_items(llm, subject, &design_check_items(requirements), DESIGN_CHECK_MAX_TURNS, settings).await
+    let items = design_check_items(requirements);
+    tracing::info!(
+        "Design check: verifying {} items ({} from the design, {} that apply to every project)",
+        items.len(),
+        requirements.len(),
+        items.len() - requirements.len()
+    );
+    verify_items(llm, subject, &items, DESIGN_CHECK_MAX_TURNS, settings).await
 }
 
 /// Turn a design document into a checklist of concrete requirements. This is
