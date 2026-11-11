@@ -295,7 +295,8 @@ impl Tool for ExecuteCommand {
                 "Run a program inside the project and return its exit status and output. \
                  There is no shell: pass the program and its arguments separately (no pipes, redirects or '&&'). \
                  The command gets no input and is killed after {} seconds, so never start anything interactive \
-                 or long-running (no TUIs, servers or watchers). Use it to build and test, e.g. command 'cargo', args ['test'].",
+                 or long-running (no TUIs, servers or watchers). Use it to build and test, e.g. command 'cargo', args ['test']. \
+                 Keep to the project directory: do not search or read the rest of the machine.",
                 self.sandbox.command_timeout.as_secs()
             ),
             parameters: serde_json::json!({

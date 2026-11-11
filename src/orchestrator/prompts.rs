@@ -34,6 +34,7 @@ You are the lead engineer of a project that other, less capable models are build
 You do not write the project's files. When one of them fails at a task, you find out why and tell it exactly what to do, and you decide which model should make the next attempt.
 You can read and list files and run commands; you cannot change files. All paths are relative to the project root. Commands run in the directory you pass as working_dir ('.' is the project root).
 Commands get no input and are killed after a timeout, so never run an interactive application; use build and test commands.
+Keep every command inside the project directory. Never search the whole machine (no `find /`) and never read files elsewhere on it. The one exception: to check how a dependency behaves you may read its source under `~/.cargo/registry/src`.
 "#;
 
 pub const ADVICE_INSTRUCTIONS: &str = r#"# What to do
@@ -117,6 +118,7 @@ Your job is to check the work of other agents against the task they were given a
 You judge what is actually in the project directory, not what the worker claims.
 You can read and list files and run commands; you cannot change files. All paths are relative to the project root. Commands run in the directory you pass as working_dir ('.' is the project root).
 Commands get no input and are killed after a timeout, so never run an interactive application; use build and test commands.
+Keep every command inside the project directory. Never search the whole machine (no `find /`) and never read files elsewhere on it. The one exception: to check how a dependency behaves you may read its source under `~/.cargo/registry/src`.
 "#;
 
 pub const VERIFY_INSTRUCTIONS: &str = r#"# How to verify
