@@ -14,7 +14,7 @@ pub mod command_executor;
 pub use command_executor::ExecuteCommand;
 
 pub mod jail;
-pub use jail::{Jail, JailPolicy};
+pub use jail::{Jail, JailPolicy, Writes};
 
 pub mod probe;
 
@@ -147,11 +147,19 @@ impl Sandbox {
         self
     }
 
-    /// Run this sandbox's commands in a jail. `writable` says whether they may
-    /// change the project. Call it after [`hiding`](Self::hiding).
-    pub fn jailed(mut self, policy: JailPolicy, writable: bool) -> Result<Self, String> {
-        self.jail = Some(Arc::new(Jail::new(policy, writable, &self.root, &self.hidden)?));
+    /// Run this sandbox's commands in a jail. `writes` says what their writes
+    /// to the project do. Call it after [`hiding`](Self::hiding).
+    pub fn jailed(mut self, policy: JailPolicy, writes: Writes) -> Result<Self, String> {
+        self.jail = Some(Arc::new(Jail::new(policy, writes, &self.root, &self.hidden)?));
         Ok(self)
+    }
+
+    /// Delete the files a jailed run kept to itself: its /tmp, and what a
+    /// scratch run's commands wrote. Called when the run ends.
+    pub fn discard_run_files(&self) {
+        if let Some(jail) = &self.jail {
+            jail.discard_run_files();
+        }
     }
 
     pub fn jail(&self) -> Option<&Jail> {

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::llm::{AgentRequest, Llm, LlmError, TokenUsage, check_credentials};
-use crate::tools::{JailPolicy, Sandbox, ToolAccess};
+use crate::tools::{JailPolicy, Sandbox, ToolAccess, Writes};
 
 /// Where a project keeps the agent definitions that can be named without a path.
 const AGENTS_DIR: &str = ".claude/agents";
@@ -30,6 +30,9 @@ pub struct Delegation {
     pub model: String,
     /// Whether the agent gets the tools that write and edit files.
     pub write_access: bool,
+    /// Whether the agent's commands may change files in a throwaway copy of
+    /// the project. Needs a jail, and excludes `write_access`.
+    pub scratch: bool,
     /// File, inside the project, that is to hold the agent's report.
     pub report_path: Option<String>,
     pub max_turns: usize,
@@ -45,6 +48,24 @@ pub struct Delegation {
 pub struct Prepared {
     request: AgentRequest,
     report: Option<Report>,
+    summary: Summary,
+}
+
+/// What a run was, for a usage record: no prompt and no reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Summary {
+    pub directory: PathBuf,
+    /// The agent as the caller named it, if it named one.
+    pub agent: Option<String>,
+    pub model: String,
+    /// "read", "write" or "scratch".
+    pub access: &'static str,
+}
+
+impl Prepared {
+    pub fn summary(&self) -> &Summary {
+        &self.summary
+    }
 }
 
 #[derive(Debug)]
@@ -77,7 +98,40 @@ struct StopCommands(Sandbox);
 impl Drop for StopCommands {
     fn drop(&mut self) {
         self.0.stop_commands();
+        self.0.discard_run_files();
     }
+}
+
+/// The hidden paths that hold files git tracks. Hiding one makes git report
+/// its files as deleted inside the jail, where an agent may stage or report
+/// them, and hides nothing: their content is in the repository's history.
+fn tracked_hidden(root: &Path, hidden: &[PathBuf]) -> Vec<String> {
+    if hidden.is_empty() || !root.join(".git").exists() {
+        return Vec::new();
+    }
+    let mut tracked = Vec::new();
+    for path in hidden {
+        // This is the server's own git call in somebody's repository, so the
+        // repository's configuration gets to start no program through it.
+        let listed = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "ls-files", "-z", "--"])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .output();
+        match listed {
+            Ok(output) if output.status.success() => {
+                let files = output.stdout.split(|byte| *byte == 0).filter(|name| !name.is_empty()).count();
+                if files > 0 {
+                    tracked.push(format!("{} ({files} tracked file{})", path.display(), if files == 1 { "" } else { "s" }));
+                }
+            }
+            // No git, or not a repository git can read: nothing to report deleted.
+            _ => {}
+        }
+    }
+    tracked
 }
 
 /// The text of an agent definition without its YAML front matter (the
@@ -124,7 +178,13 @@ fn read_agent(directory: &Path, agent: &str) -> Result<String, String> {
 /// What the agent is told about where it is. Agent files are usually written
 /// for another harness, so this names the tools that exist here and says what
 /// to do about the ones that do not.
-fn rules(write_access: bool, report: Option<&str>, command_timeout: Duration, jail: Option<&JailPolicy>) -> String {
+fn rules(
+    write_access: bool,
+    scratch: bool,
+    report: Option<&str>,
+    command_timeout: Duration,
+    jail: Option<&JailPolicy>,
+) -> String {
     let mut text = String::from(
         "You are working in an existing project, through Clankistrator. Your instructions may have been \
          written for a different tool; this is what you have here.\n\n# Your tools\n\n",
@@ -143,10 +203,26 @@ fn rules(write_access: bool, report: Option<&str>, command_timeout: Duration, ja
              is yours to read: the home directory is empty and environment files cannot be opened. \
              `Read-only file system`, `Permission denied` or a file that is missing there is the jail at \
              work, not a fault. Do not look for a way around it. If it keeps you from what you were asked \
-             to do, say so in your reply.\n",
-            if write_access { "writable" } else { "read-only" },
+             to do, say so in your reply. /tmp is yours: what you put there stays for your later commands \
+             and is deleted when you finish.\n",
+            if write_access {
+                "writable"
+            } else if scratch {
+                "a throwaway copy"
+            } else {
+                "read-only"
+            },
             if jail.network { "a network" } else { "no network" },
         ));
+    }
+    if scratch {
+        text.push_str(
+            "- Your commands work on a throwaway copy of the project. They may change files in it, for \
+             example to break a line and see whether a test notices. A change stays for your later commands \
+             and is thrown away when you finish: nothing a command writes reaches the real project, so there \
+             is nothing to restore. read_file and list_files show the real project, without your changes; to \
+             see a file as your commands left it, print it with a command. Run one command at a time.\n",
+        );
     }
     text.push_str(&format!(
         "- Paths are relative to the project root. Paths outside the project are refused, and so are \
@@ -195,6 +271,7 @@ pub fn prepare(delegation: Delegation) -> Result<Prepared, String> {
         prompt,
         model,
         write_access,
+        scratch,
         report_path,
         max_turns,
         command_timeout,
@@ -213,13 +290,38 @@ pub fn prepare(delegation: Delegation) -> Result<Prepared, String> {
     if !directory.is_dir() {
         return Err(format!("directory {} does not exist", directory.display()));
     }
+    if scratch && write_access {
+        return Err("scratch and write_access cannot be combined: scratch throws every change away".to_string());
+    }
+    if scratch && jail.is_none() {
+        return Err(
+            "scratch needs the jail, and this server runs commands without one (--no-jail): \
+             a command's writes would reach the project"
+                .to_string(),
+        );
+    }
     let mut sandbox = Sandbox::new(&directory, command_timeout)
         .map_err(|e| format!("could not use directory {}: {e}", directory.display()))?
         .hiding_env_files()
         .guarding_unseen_code()
         .hiding(&hidden)?;
+    let tracked = tracked_hidden(sandbox.root(), &hidden);
+    if !tracked.is_empty() {
+        return Err(format!(
+            "this server hides paths that git tracks in {}: {}. An agent would see those files as deleted \
+             and could stage or report that, and hiding them protects nothing, because their content is in \
+             the repository's history. Take them off --hide, or stop tracking them.",
+            sandbox.root().display(),
+            tracked.join(", ")
+        ));
+    }
+    let writes = match (write_access, scratch) {
+        (true, _) => Writes::Project,
+        (false, true) => Writes::Scratch,
+        (false, false) => Writes::Refused,
+    };
     if let Some(policy) = jail.clone() {
-        sandbox = sandbox.jailed(policy, write_access)?;
+        sandbox = sandbox.jailed(policy, writes)?;
     }
     // Commands cannot see a repository above the directory they run in, so a
     // subdirectory of a repository would leave the agent without git.
@@ -244,7 +346,17 @@ pub fn prepare(delegation: Delegation) -> Result<Prepared, String> {
     };
 
     let mut preamble =
-        rules(write_access, report.as_ref().map(|r| r.given.as_str()), command_timeout, jail.as_ref());
+        rules(write_access, scratch, report.as_ref().map(|r| r.given.as_str()), command_timeout, jail.as_ref());
+    let summary = Summary {
+        directory: sandbox.root().to_path_buf(),
+        agent: agent.as_deref().map(str::trim).filter(|agent| !agent.is_empty()).map(str::to_string),
+        model: model.clone(),
+        access: match writes {
+            Writes::Project => "write",
+            Writes::Scratch => "scratch",
+            Writes::Refused => "read",
+        },
+    };
     if let Some(agent) = agent.as_deref().filter(|agent| !agent.trim().is_empty()) {
         preamble.push_str("\n# Your instructions\n\n");
         preamble.push_str(&read_agent(sandbox.root(), agent)?);
@@ -261,6 +373,7 @@ pub fn prepare(delegation: Delegation) -> Result<Prepared, String> {
             max_turns: max_turns.max(1),
         },
         report,
+        summary,
     })
 }
 
@@ -275,7 +388,7 @@ pub fn prepare(delegation: Delegation) -> Result<Prepared, String> {
 /// On failure nothing is written: a report file from an earlier run stays as
 /// it is, and the error says that the agent may have left work half done.
 pub async fn run(llm: &dyn Llm, prepared: Prepared) -> Result<Outcome, String> {
-    let Prepared { request, report } = prepared;
+    let Prepared { request, report, summary: _ } = prepared;
     let model = request.model.clone();
     let root = request.sandbox.root().to_path_buf();
     let _stop = StopCommands(request.sandbox.clone());
@@ -385,6 +498,7 @@ pub(crate) mod tests {
             prompt: "- **Diff:** `git diff abc123`".into(),
             model: "ollama:test".into(),
             write_access: false,
+            scratch: false,
             report_path: None,
             max_turns: 7,
             command_timeout: Duration::from_secs(90),
@@ -457,6 +571,63 @@ pub(crate) mod tests {
 
         d.hidden = vec![PathBuf::from("../outside")];
         assert!(prepare(d).unwrap_err().contains("hidden path"));
+    }
+
+    #[test]
+    fn scratch_needs_a_jail_and_excludes_write_access() {
+        let dir = project();
+        let mut d = delegation(dir.path());
+        d.scratch = true;
+        assert!(prepare(d.clone()).unwrap_err().contains("scratch needs the jail"));
+
+        d.jail = Some(JailPolicy::default());
+        d.write_access = true;
+        assert!(prepare(d.clone()).unwrap_err().contains("cannot be combined"));
+
+        if crate::tools::jail::probe().is_err() {
+            return; // no bubblewrap here: the overlay cannot be tried
+        }
+        d.write_access = false;
+        let prepared = prepare(d.clone()).unwrap();
+        assert_eq!(prepared.summary().access, "scratch");
+        assert_eq!(prepared.summary().agent.as_deref(), Some("reviewer"));
+        assert_eq!(prepared.request.tools, ToolAccess::Inspect, "scratch gives no file-writing tools");
+        assert!(prepared.request.preamble.contains("In it the project is a throwaway copy"));
+        assert!(prepared.request.preamble.contains("read_file and list_files show the real project"));
+
+        d.scratch = false;
+        let plain = prepare(d).unwrap();
+        assert_eq!(plain.summary().access, "read");
+        assert!(!plain.request.preamble.contains("throwaway"));
+    }
+
+    #[test]
+    fn a_hidden_path_that_git_tracks_is_refused_by_name() {
+        let dir = project();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .is_ok_and(|out| out.status.success())
+        };
+        std::fs::create_dir_all(dir.path().join("linked")).unwrap();
+        std::fs::create_dir_all(dir.path().join("scratchpad")).unwrap();
+        std::fs::write(dir.path().join("linked/project.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("linked/url"), "x").unwrap();
+        std::fs::write(dir.path().join("scratchpad/notes.md"), "untracked").unwrap();
+        if !git(&["init", "-q"]) || !git(&["add", "linked"]) {
+            return; // git is not installed
+        }
+
+        let mut d = delegation(dir.path());
+        d.hidden = vec![PathBuf::from("scratchpad"), PathBuf::from("linked")];
+        let error = prepare(d.clone()).unwrap_err();
+        assert!(error.contains("linked (2 tracked files)"), "{error}");
+        assert!(!error.contains("scratchpad"), "an untracked path may be hidden: {error}");
+
+        d.hidden = vec![PathBuf::from("scratchpad"), PathBuf::from("not-there")];
+        assert!(prepare(d).is_ok());
     }
 
     #[test]

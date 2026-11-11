@@ -145,6 +145,15 @@ struct Args {
     #[arg(long, requires = "delegate", value_delimiter = ',', value_name = "PATH,PATH")]
     hide: Vec<PathBuf>,
 
+    /// With --delegate: append one line per agent run to this file (JSON: time, directory, agent,
+    /// model, access, outcome, seconds, tokens). It must be outside the projects agents work in
+    #[arg(long, requires = "delegate", value_name = "FILE")]
+    usage_log: Option<PathBuf>,
+
+    /// Minutes one agent run (all of its turns) may take before it is given up on
+    #[arg(long, value_name = "MINUTES", default_value_t = llm::DEFAULT_AGENT_RUN_TIMEOUT.as_secs() / 60)]
+    run_timeout: u64,
+
     /// Test the given models instead of orchestrating: one plain request and one
     /// tool call each. Uses no files and runs no commands
     #[arg(long, num_args = 1.., value_name = "MODEL", conflicts_with_all = ["resume", "mcp_server", "check"])]
@@ -268,6 +277,7 @@ async fn run() -> Result<ExitCode> {
     let early = Args::parse();
     load_settings(early.env_file.as_deref(), early.delegate)?;
     let args = Args::parse();
+    llm::set_agent_run_timeout(Duration::from_secs(args.run_timeout.max(1) * 60));
 
     if args.mcp_server {
         // stdout carries the protocol, so logs go to stderr.
@@ -308,6 +318,10 @@ async fn run() -> Result<ExitCode> {
                 command_timeout: Duration::from_secs(args.command_timeout.max(1)),
                 jail,
                 hidden: args.hide.clone(),
+                usage_log: match &args.usage_log {
+                    Some(log) if !log.is_absolute() => bail!("--usage-log {} must be an absolute path", log.display()),
+                    log => log.clone(),
+                },
             });
         }
         server.run().await?;

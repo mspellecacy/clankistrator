@@ -42,6 +42,83 @@ pub struct Delegating {
     pub jail: Option<crate::tools::JailPolicy>,
     /// Paths in a project, relative to its root, that agents may not see.
     pub hidden: Vec<PathBuf>,
+    /// A file that gets one line per agent run (see [`RunRecord`]).
+    pub usage_log: Option<PathBuf>,
+}
+
+/// One line of the usage log: what ran, on which model, for how long, at what
+/// cost in tokens, and how it ended. Never the prompt, the reply or an error
+/// text. A run that ends without [`finish`](Self::finish), because its client
+/// cancelled it or went away, is written as "cancelled" when it is dropped.
+struct RunRecord {
+    log: Option<PathBuf>,
+    summary: delegate::Summary,
+    started: std::time::Instant,
+    written: bool,
+}
+
+/// Seconds since 1970 as an ISO 8601 UTC timestamp.
+fn utc_timestamp(seconds: u64) -> String {
+    let (days, rest) = (seconds / 86_400, seconds % 86_400);
+    // Days to a civil date (Howard Hinnant's algorithm), for dates from 1970 on.
+    let z = days + 719_468;
+    let (era, day_of_era) = (z / 146_097, z % 146_097);
+    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 { shifted_month + 3 } else { shifted_month - 9 };
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rest / 3_600, rest % 3_600 / 60, rest % 60)
+}
+
+impl RunRecord {
+    fn start(log: Option<&Path>, summary: &delegate::Summary) -> Self {
+        Self { log: log.map(Path::to_path_buf), summary: summary.clone(), started: std::time::Instant::now(), written: false }
+    }
+
+    /// Write the run's line and return how many seconds it took.
+    fn finish(mut self, outcome: &Result<delegate::Outcome, String>) -> u64 {
+        match outcome {
+            Ok(outcome) => self.write("ok", Some(&outcome.usage)),
+            Err(_) => self.write("failed", None),
+        }
+        self.started.elapsed().as_secs()
+    }
+
+    fn write(&mut self, outcome: &str, usage: Option<&crate::llm::TokenUsage>) {
+        self.written = true;
+        let Some(log) = &self.log else { return };
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+        let line = json!({
+            "time": utc_timestamp(now),
+            "directory": self.summary.directory,
+            "agent": self.summary.agent,
+            "model": self.summary.model,
+            "access": self.summary.access,
+            "outcome": outcome,
+            "seconds": self.started.elapsed().as_secs(),
+            "input_tokens": usage.map(|usage| usage.input_tokens),
+            "cached_input_tokens": usage.map(|usage| usage.cached_input_tokens),
+            "output_tokens": usage.map(|usage| usage.output_tokens),
+        });
+        let appended = std::fs::OpenOptions::new().create(true).append(true).open(log).and_then(|mut file| {
+            use std::io::Write as _;
+            writeln!(file, "{line}")
+        });
+        // The log is bookkeeping: a run never fails over it.
+        if let Err(e) = appended {
+            tracing::warn!("could not write to the usage log {}: {e}", log.display());
+        }
+    }
+}
+
+impl Drop for RunRecord {
+    fn drop(&mut self) {
+        if !self.written {
+            self.write("cancelled", None);
+        }
+    }
 }
 
 pub struct McpServer {
@@ -79,10 +156,11 @@ fn tool_result(result: Result<String, String>) -> Value {
     }
 }
 
-fn agent_result(outcome: Result<delegate::Outcome, String>) -> Value {
+fn agent_result(outcome: Result<delegate::Outcome, String>, seconds: u64) -> Value {
     tool_result(outcome.and_then(|outcome| {
         serde_json::to_string_pretty(&json!({
             "model": outcome.model,
+            "seconds": seconds,
             "reply": outcome.reply,
             "report_path": outcome.report.as_ref().map(|report| &report.path),
             "report_written_by": outcome.report.as_ref().map(|report| {
@@ -183,6 +261,7 @@ impl McpServer {
                             let llm = self.llm.clone();
                             let outgoing = outgoing.clone();
                             let response_id = id.clone();
+                            let record = RunRecord::start(self.usage_log(), prepared.summary());
                             let agent = agents.spawn(async move {
                                 let run = delegate::run(llm.as_ref(), *prepared);
                                 tokio::pin!(run);
@@ -208,7 +287,8 @@ impl McpServer {
                                         }
                                     }
                                 };
-                                let _ = outgoing.send(respond(&response_id, Ok(agent_result(outcome))));
+                                let seconds = record.finish(&outcome);
+                                let _ = outgoing.send(respond(&response_id, Ok(agent_result(outcome, seconds))));
                             });
                             running.insert(request_key(&id), (agent, id));
                         }
@@ -244,7 +324,10 @@ impl McpServer {
             Begun::Reply(response) => response,
             Begun::Cancel(_) => None,
             Begun::Agent { id, prepared, .. } => {
-                Some(respond(&id, Ok(agent_result(delegate::run(self.llm.as_ref(), *prepared).await))))
+                let record = RunRecord::start(self.usage_log(), prepared.summary());
+                let outcome = delegate::run(self.llm.as_ref(), *prepared).await;
+                let seconds = record.finish(&outcome);
+                Some(respond(&id, Ok(agent_result(outcome, seconds))))
             }
         }
     }
@@ -294,6 +377,10 @@ impl McpServer {
         Begun::Reply(Some(respond(&id, outcome)))
     }
 
+    fn usage_log(&self) -> Option<&Path> {
+        self.delegating.as_ref().and_then(|delegating| delegating.usage_log.as_deref())
+    }
+
     /// Check a `run_agent` call against what the server was started to allow.
     fn prepare_agent(&self, args: &Value) -> Result<delegate::Prepared, String> {
         let Some(delegating) = &self.delegating else {
@@ -322,18 +409,29 @@ impl McpServer {
                 .and_then(|turns| usize::try_from(turns).ok())
                 .ok_or("max_turns must be a positive whole number")?,
         };
-        delegate::prepare(Delegation {
+        let prepared = delegate::prepare(Delegation {
             directory: PathBuf::from(text_arg(args, "directory")?.trim()),
             agent: text("agent").map(str::to_string),
             prompt: text_arg(args, "prompt")?.to_string(),
             model: model.to_string(),
             write_access: args.get("write_access").and_then(Value::as_bool).unwrap_or(false),
+            scratch: args.get("scratch").and_then(Value::as_bool).unwrap_or(false),
             report_path: text("report_path").map(str::to_string),
             max_turns,
             command_timeout: delegating.command_timeout,
             jail: delegating.jail.clone(),
             hidden: delegating.hidden.clone(),
-        })
+        })?;
+        // The log names every project the server has worked in, and an agent reads its project.
+        if let Some(log) = &delegating.usage_log
+            && log.starts_with(&prepared.summary().directory)
+        {
+            return Err(format!(
+                "the usage log {} is inside the project; start the server with a --usage-log outside it",
+                log.display()
+            ));
+        }
+        Ok(prepared)
     }
 
     fn run_agent_tool(delegating: &Delegating) -> Value {
@@ -343,7 +441,9 @@ impl McpServer {
                 format!(
                     "Commands it runs are jailed: they see the project (read-only without write_access) but not \
                      your home directory, environment files or the paths this server hides, and they have {}. \
-                     They are not checked by your own permission rules or hooks.",
+                     They are not checked by your own permission rules or hooks. With scratch, its commands \
+                     may change files in a throwaway copy of the project and nothing reaches the real one: \
+                     use that for a reviewer that has to change code to test it.",
                     if jail.network { "the network" } else { "no network" }
                 ),
                 "Without them the project is read-only to its commands as well.",
@@ -384,6 +484,10 @@ impl McpServer {
                     "write_access": {
                         "type": "boolean",
                         "description": format!("Give the agent the tools that write and edit files. Defaults to false. {without_write}")
+                    },
+                    "scratch": {
+                        "type": "boolean",
+                        "description": "Let the agent's commands change files in a throwaway copy of the project, deleted when the run ends. Nothing they write reaches the project. Defaults to false. Needs the jail, and cannot be combined with write_access."
                     },
                     "report_path": {
                         "type": "string",
@@ -628,6 +732,89 @@ mod tests {
     }
 
     #[test]
+    fn timestamps_are_iso_utc() {
+        assert_eq!(utc_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc_timestamp(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(utc_timestamp(1_709_164_800), "2024-02-29T00:00:00Z");
+        assert_eq!(utc_timestamp(1_735_689_599), "2024-12-31T23:59:59Z");
+    }
+
+    #[tokio::test]
+    async fn every_run_gets_one_line_in_the_usage_log_and_nothing_of_what_was_said() {
+        let project = crate::delegate::tests::project();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let log = elsewhere.path().join("usage.jsonl");
+        let lines = || -> Vec<Value> {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        };
+        let server_with = |llm: Arc<dyn Llm>, log: &Path| {
+            McpServer::new(llm, "ollama:test".into()).delegating(Delegating {
+                models: vec!["ollama:small".into()],
+                max_turns: 3,
+                command_timeout: Duration::from_secs(30),
+                jail: None,
+                hidden: Vec::new(),
+                usage_log: Some(log.to_path_buf()),
+            })
+        };
+        let arguments = json!({"directory": project.path(), "agent": "reviewer", "prompt": "SECRET-PROMPT"});
+
+        let server = server_with(Arc::new(ActingLlm::replying("SECRET-REPLY")), &log);
+        let done = call(&server, run_agent(1, arguments.clone())).await;
+        let result: Value = serde_json::from_str(tool_text(&done)).unwrap();
+        assert!(result["seconds"].is_u64(), "the caller is told how long the run took: {result}");
+
+        let server = server_with(Arc::new(ActingLlm::new(|_| Err("401 SECRET-ERROR".to_string()))), &log);
+        let failed = call(&server, run_agent(2, arguments.clone())).await;
+        assert_eq!(failed["result"]["isError"], true);
+
+        let written = lines();
+        assert_eq!(written.len(), 2);
+        let ok = &written[0];
+        assert_eq!(ok["outcome"], "ok");
+        assert_eq!(ok["agent"], "reviewer");
+        assert_eq!(ok["model"], "ollama:small");
+        assert_eq!(ok["access"], "read");
+        assert_eq!(ok["directory"], json!(project.path().canonicalize().unwrap()));
+        let tokens = |name: &str| ok[name].as_u64();
+        assert_eq!((tokens("input_tokens"), tokens("cached_input_tokens"), tokens("output_tokens")), (Some(10), Some(4), Some(2)));
+        assert!(ok["time"].as_str().unwrap().ends_with('Z') && ok["seconds"].is_u64());
+        assert_eq!(written[1]["outcome"], "failed");
+        assert!(written[1]["input_tokens"].is_null(), "a failed run's tokens are not known");
+        let text = std::fs::read_to_string(&log).unwrap();
+        for said in ["SECRET-PROMPT", "SECRET-REPLY", "SECRET-ERROR"] {
+            assert!(!text.contains(said), "{said} must not be logged");
+        }
+
+        // A run that never reaches its end is written when it is dropped.
+        let summary = crate::delegate::Summary {
+            directory: project.path().to_path_buf(),
+            agent: None,
+            model: "ollama:small".into(),
+            access: "scratch",
+        };
+        drop(RunRecord::start(Some(&log), &summary));
+        assert_eq!(lines()[2]["outcome"], "cancelled");
+        assert_eq!(lines()[2]["access"], "scratch");
+
+        // A log that cannot be written does not fail the run.
+        let server = server_with(Arc::new(ActingLlm::replying("fine")), &elsewhere.path().join("no/such/dir/usage.jsonl"));
+        let done = call(&server, run_agent(3, arguments.clone())).await;
+        assert_ne!(done["result"]["isError"], true, "{done}");
+
+        // A log inside the project would be read by the agents working there.
+        let inside = project.path().canonicalize().unwrap().join("usage.jsonl");
+        let server = server_with(Arc::new(ActingLlm::replying("unused")), &inside);
+        let refused = call(&server, run_agent(4, arguments)).await;
+        assert!(tool_text(&refused).contains("inside the project"), "{refused}");
+        assert!(!inside.exists());
+    }
+
+    #[test]
     fn the_tool_description_says_whether_commands_are_jailed() {
         let mut delegating = Delegating {
             models: vec!["ollama:test".into()],
@@ -635,6 +822,7 @@ mod tests {
             command_timeout: Duration::from_secs(1),
             jail: None,
             hidden: Vec::new(),
+            usage_log: None,
         };
         let text = |delegating: &Delegating| McpServer::run_agent_tool(delegating).to_string();
         assert!(text(&delegating).contains("ordinary processes, not jailed"));
@@ -656,6 +844,7 @@ mod tests {
             command_timeout: Duration::from_secs(30),
             jail: None,
             hidden: Vec::new(),
+            usage_log: None,
         })
     }
 

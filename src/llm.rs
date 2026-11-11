@@ -20,8 +20,19 @@ use tokio::time::Instant;
 use crate::tools::{Sandbox, ToolAccess};
 
 /// Upper bound on one agent run (all of its turns), so a stalled connection
-/// cannot hang the orchestrator forever.
-const AGENT_RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// cannot hang the orchestrator forever. `--run-timeout` replaces it.
+pub const DEFAULT_AGENT_RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+static AGENT_RUN_TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+/// Set the bound on one agent run for this process. Only the first call counts.
+pub fn set_agent_run_timeout(timeout: Duration) {
+    let _ = AGENT_RUN_TIMEOUT.set(timeout);
+}
+
+fn agent_run_timeout() -> Duration {
+    AGENT_RUN_TIMEOUT.get().copied().unwrap_or(DEFAULT_AGENT_RUN_TIMEOUT)
+}
 
 /// rig only knows output limits for older Claude models and refuses to send a
 /// request without one, so newer models get this value.
@@ -641,11 +652,12 @@ impl RigLlm {
 impl Llm for RigLlm {
     fn run<'a>(&'a self, request: AgentRequest) -> LlmFuture<'a> {
         Box::pin(async move {
-            match tokio::time::timeout(AGENT_RUN_TIMEOUT, self.dispatch(&request)).await {
+            let limit = agent_run_timeout();
+            match tokio::time::timeout(limit, self.dispatch(&request)).await {
                 Ok(result) => result,
                 Err(_) => Err(LlmError::Other(anyhow!(
-                    "the model did not finish within {} minutes",
-                    AGENT_RUN_TIMEOUT.as_secs() / 60
+                    "the model did not finish within {} minutes (--run-timeout raises the limit)",
+                    limit.as_secs() / 60
                 ))),
             }
         })

@@ -16,6 +16,11 @@
 //!
 //! Everything a jail allows is decided when the server starts. Nothing in a
 //! tool call can loosen it.
+//!
+//! A call can ask for [`Writes::Scratch`]: commands then work on an overlay of
+//! the project whose writes go to a directory of their own, which is deleted
+//! when the run ends. That lets an agent change code to test it (a reviewer's
+//! mutation check) with nothing of the user's bound writable.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -66,12 +71,96 @@ impl JailPolicy {
     }
 }
 
+/// What a jailed command's writes to the project do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Writes {
+    /// Refused: the project is read-only.
+    Refused,
+    /// They change the project.
+    Project,
+    /// They land in a throwaway layer over the project and never reach it.
+    Scratch,
+}
+
+/// The files a jailed run keeps to itself, deleted with the run: a `/tmp`
+/// that lasts from one command to the next (each command is a jail of its
+/// own, so an ordinary empty `/tmp` would forget what the last one wrote),
+/// and for a [`Writes::Scratch`] run the overlay's upper and work directories.
+#[derive(Debug)]
+struct RunFiles {
+    dir: PathBuf,
+    /// Present for a scratch run. Two overlay mounts sharing an upper
+    /// directory are undefined behaviour, and a model may ask for two
+    /// commands at once: they take turns.
+    turn: Option<tokio::sync::Mutex<()>>,
+}
+
+impl RunFiles {
+    fn new(scratch: bool) -> Result<Self, String> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!(
+            "clankistrator-run-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let dir = std::env::temp_dir().join(name);
+        // Left over from an earlier process with the same id.
+        remove_run_files(&dir);
+        let failed = |e: std::io::Error| format!("could not create the run directory {}: {e}", dir.display());
+        // It will hold what commands put in /tmp and a copy of every file a
+        // scratch command changes, in a directory other users of the machine
+        // can list: only its owner gets in.
+        std::fs::create_dir(&dir).map_err(failed)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(failed)?;
+        }
+        let parts: &[&str] = if scratch { &["tmp", "upper", "work"] } else { &["tmp"] };
+        for part in parts {
+            std::fs::create_dir(dir.join(part)).map_err(failed)?;
+        }
+        Ok(Self { dir, turn: scratch.then(|| tokio::sync::Mutex::new(())) })
+    }
+}
+
+impl Drop for RunFiles {
+    fn drop(&mut self) {
+        remove_run_files(&self.dir);
+    }
+}
+
+/// Delete a run's directory. Overlayfs leaves a `work/work` directory that
+/// its owner cannot read, which stops a plain recursive delete.
+fn remove_run_files(dir: &Path) {
+    if std::fs::remove_dir_all(dir).is_ok() || !dir.exists() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut queue = vec![dir.to_path_buf()];
+        while let Some(next) = queue.pop() {
+            let _ = std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o700));
+            for entry in std::fs::read_dir(&next).into_iter().flatten().flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    queue.push(entry.path());
+                }
+            }
+        }
+    }
+    if let Err(e) = std::fs::remove_dir_all(dir) {
+        tracing::warn!("could not delete the run directory {}: {e}", dir.display());
+    }
+}
+
 /// One project's jail: the policy, plus what was found in the project when
 /// the agent's run was prepared.
 #[derive(Debug)]
 pub struct Jail {
     policy: JailPolicy,
-    writable: bool,
+    writes: Writes,
+    files: RunFiles,
     /// Environment files in the project, each covered by an unreadable file.
     env_files: Vec<PathBuf>,
     /// For a worktree or submodule: the git directory its `.git` file points to.
@@ -143,7 +232,7 @@ fn env_files(root: &Path, hidden: &[PathBuf]) -> Vec<PathBuf> {
 
 impl Jail {
     /// Work out the jail for one agent run in the project at `root`.
-    pub(super) fn new(policy: JailPolicy, writable: bool, root: &Path, hidden: &[PathBuf]) -> Result<Self, String> {
+    pub(super) fn new(policy: JailPolicy, writes: Writes, root: &Path, hidden: &[PathBuf]) -> Result<Self, String> {
         if let Some(home) = &policy.home
             && home.starts_with(root)
         {
@@ -152,7 +241,54 @@ impl Jail {
                 root.display()
             ));
         }
-        Ok(Self { policy, writable, env_files: env_files(root, hidden), git_dir: linked_git_dir(root) })
+        let files = RunFiles::new(writes == Writes::Scratch)?;
+        let jail = Self { policy, writes, files, env_files: env_files(root, hidden), git_dir: linked_git_dir(root) };
+        if jail.writes == Writes::Scratch {
+            // Found out now, so that the caller hears it and not the agent,
+            // command after command.
+            jail.check_overlay(root)?;
+        }
+        Ok(jail)
+    }
+
+    /// Mount the scratch overlay once, to learn whether this machine can.
+    fn check_overlay(&self, root: &Path) -> Result<(), String> {
+        let output = std::process::Command::new(BWRAP)
+            .args(self.arguments(root, &[], root))
+            .arg("true")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("could not start bubblewrap (`{BWRAP}`): {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "scratch writes need an overlay mount in the jail (bubblewrap 0.11 or later, and a kernel that \
+                 lets a user namespace mount overlayfs), and this machine refused it: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+
+    pub fn writes(&self) -> Writes {
+        self.writes
+    }
+
+    /// The lock a command holds while it runs, where commands must take turns.
+    pub(super) fn turn(&self) -> Option<&tokio::sync::Mutex<()>> {
+        self.files.turn.as_ref()
+    }
+
+    /// Delete the run's own files now (its /tmp and any scratch layer),
+    /// without waiting for the last clone of the sandbox to go. Commands
+    /// still running lose what they wrote there.
+    pub(super) fn discard_run_files(&self) {
+        remove_run_files(&self.files.dir);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_dir(&self) -> &Path {
+        &self.files.dir
     }
 
     pub fn network(&self) -> bool {
@@ -166,7 +302,8 @@ impl Jail {
         let mut args: Vec<OsString> = Vec::new();
         let mut add = |parts: &[&std::ffi::OsStr]| args.extend(parts.iter().map(|part| part.to_os_string()));
         let flag = |text: &'static str| std::ffi::OsStr::new(text);
-        let project_bind = flag(if self.writable { "--bind" } else { "--ro-bind" });
+        // Only a run that may change the project gets any of it bound writable.
+        let project_bind = flag(if self.writes == Writes::Project { "--bind" } else { "--ro-bind" });
 
         add(&[flag("--unshare-all")]);
         if self.policy.network {
@@ -180,6 +317,12 @@ impl Jail {
 
         for dir in EMPTIED.iter().map(Path::new).filter(|dir| dir.is_dir()) {
             add(&[flag("--tmpfs"), dir.as_os_str()]);
+        }
+        // The run's own /tmp, over the empty one, so that a later command
+        // finds what an earlier one left there.
+        let tmp = self.files.dir.join("tmp");
+        if tmp.is_dir() && Path::new("/tmp").is_dir() {
+            add(&[flag("--bind"), tmp.as_os_str(), flag("/tmp")]);
         }
         if let Some(home) = self.policy.home.as_deref().filter(|home| home.is_dir()) {
             add(&[flag("--tmpfs"), home.as_os_str()]);
@@ -199,9 +342,17 @@ impl Jail {
         if let Some(git_dir) = self.git_dir.as_deref().filter(|dir| dir.is_dir()) {
             add(&[project_bind, git_dir.as_os_str(), git_dir.as_os_str()]);
         }
-        add(&[project_bind, root.as_os_str(), root.as_os_str()]);
+        if self.writes == Writes::Scratch {
+            // The project is the overlay's read-only lower layer. If the mount
+            // fails, bubblewrap stops: there is no falling back to a bind.
+            let (upper, work) = (self.files.dir.join("upper"), self.files.dir.join("work"));
+            add(&[flag("--overlay-src"), root.as_os_str()]);
+            add(&[flag("--overlay"), upper.as_os_str(), work.as_os_str(), root.as_os_str()]);
+        } else {
+            add(&[project_bind, root.as_os_str(), root.as_os_str()]);
+        }
 
-        if self.writable {
+        if self.writes == Writes::Project {
             // A command may change the project, but not the files that run
             // code later without ever showing in a diff.
             let git_dir = self.git_dir.clone().unwrap_or_else(|| root.join(".git"));

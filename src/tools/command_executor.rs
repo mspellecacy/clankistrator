@@ -249,6 +249,14 @@ impl ExecuteCommand {
         if self.sandbox.commands_stopped() {
             return STOPPED.to_string();
         }
+        // In a scratch run, commands share one overlay and take turns.
+        let _turn = match self.sandbox.jail().and_then(|jail| jail.turn()) {
+            Some(turn) => Some(turn.lock().await),
+            None => None,
+        };
+        if self.sandbox.commands_stopped() {
+            return STOPPED.to_string();
+        }
         let mut cmd = self.build_command(args, &cwd);
 
         let mut child = match cmd.spawn() {
@@ -583,7 +591,7 @@ mod tests {
     /// A jailed tool for a project under a pretend home directory:
     /// `<dir>/home/dev/project`. `None` where bubblewrap cannot build a jail.
     fn jailed(
-        writable: bool,
+        writes: crate::tools::Writes,
         timeout: Duration,
         hidden: &[&str],
         readable: &[&str],
@@ -617,9 +625,11 @@ mod tests {
         };
         let hidden: Vec<std::path::PathBuf> = hidden.iter().map(std::path::PathBuf::from).collect();
         let sandbox =
-            Sandbox::new(&root, timeout).unwrap().hiding(&hidden).unwrap().jailed(policy, writable).unwrap();
+            Sandbox::new(&root, timeout).unwrap().hiding(&hidden).unwrap().jailed(policy, writes).unwrap();
         Some((dir, ExecuteCommand { sandbox }))
     }
+
+    use crate::tools::Writes;
 
     fn sh(script: &str) -> ExecuteCommandArgs {
         args("sh", &["-c", script])
@@ -627,7 +637,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_jailed_command_sees_the_project_and_nothing_else_of_the_users() {
-        let Some((_dir, tool)) = jailed(false, Duration::from_secs(20), &["private"], &["tools"]) else { return };
+        let Some((_dir, tool)) = jailed(Writes::Refused, Duration::from_secs(20), &["private"], &["tools"]) else { return };
 
         let out = tool.run(&sh("cat source.txt && cat ../../tools/hello")).await;
         assert!(out.contains("SOURCE") && out.contains("TOOLCHAIN"), "{out}");
@@ -658,7 +668,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_writable_jail_lets_commands_change_the_project_but_not_what_runs_unseen() {
-        let Some((dir, tool)) = jailed(true, Duration::from_secs(20), &[], &[]) else { return };
+        let Some((dir, tool)) = jailed(Writes::Project, Duration::from_secs(20), &[], &[]) else { return };
         let root = tool.sandbox.root().to_path_buf();
 
         let out = tool.run(&sh("echo changed > source.txt && echo new > new.txt && mkdir -p .git/objects/ab")).await;
@@ -718,7 +728,7 @@ mod tests {
     /// through bubblewrap.
     #[tokio::test]
     async fn a_jailed_command_that_times_out_dies_with_everything_it_started() {
-        let Some((_dir, tool)) = jailed(true, Duration::from_secs(1), &[], &[]) else { return };
+        let Some((_dir, tool)) = jailed(Writes::Project, Duration::from_secs(1), &[], &[]) else { return };
         let beat = tool.sandbox.root().join("beat");
         let out = tool.run(&sh(&format!("({BEAT}) & {BEAT}"))).await;
         assert!(out.contains("timed out after 1 seconds"), "{out}");
@@ -728,7 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn stopping_a_sandbox_kills_its_jailed_commands() {
-        let Some((_dir, tool)) = jailed(true, Duration::from_secs(60), &[], &[]) else { return };
+        let Some((_dir, tool)) = jailed(Writes::Project, Duration::from_secs(60), &[], &[]) else { return };
         let sandbox = tool.sandbox.clone();
         let beat = sandbox.root().join("beat");
         let call = tokio::spawn(async move { tool.run(&sh(&format!("({BEAT}) & {BEAT}"))).await });
@@ -765,7 +775,7 @@ mod tests {
             return; // git is not installed, or too old for worktrees
         }
         let policy = crate::tools::JailPolicy { home: Some(base.join("home")), ..Default::default() };
-        let sandbox = Sandbox::new(base.join("tree"), Duration::from_secs(20)).unwrap().jailed(policy, false).unwrap();
+        let sandbox = Sandbox::new(base.join("tree"), Duration::from_secs(20)).unwrap().jailed(policy, Writes::Refused).unwrap();
         let out = ExecuteCommand { sandbox }.run(&args("git", &["log", "--oneline"])).await;
         assert!(out.starts_with("Command succeeded.") && out.contains("first commit"), "{out}");
     }
@@ -775,7 +785,158 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let policy = crate::tools::JailPolicy { home: Some(root.join("me")), ..Default::default() };
-        let error = Sandbox::new(&root, Duration::from_secs(1)).unwrap().jailed(policy, false).unwrap_err();
+        let error = Sandbox::new(&root, Duration::from_secs(1)).unwrap().jailed(policy, Writes::Refused).unwrap_err();
         assert!(error.contains("home directory"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn scratch_writes_are_seen_by_later_commands_and_never_reach_the_project() {
+        let Some((dir, tool)) = jailed(Writes::Scratch, Duration::from_secs(20), &["private"], &[]) else { return };
+        let root = tool.sandbox.root().to_path_buf();
+        let scratch = tool.sandbox.jail().unwrap().run_dir().to_path_buf();
+        assert!(scratch.join("upper").is_dir());
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "the layer holds copies of project files: only its owner may read it");
+        }
+
+        let script = "echo mutated > source.txt && echo new > new.txt && rm nested/.env.production; \
+                      echo evil > .git/hooks/pre-commit; echo x > ../../planted.txt; echo done";
+        let out = tool.run(&sh(script)).await;
+        assert!(out.contains("done"), "{out}");
+        // A later command works on what the first one left.
+        let out = tool.run(&sh("cat source.txt new.txt .git/hooks/pre-commit")).await;
+        assert!(out.contains("mutated") && out.contains("new") && out.contains("evil"), "{out}");
+        // What is hidden from a read-only run is hidden here too.
+        let out = tool.run(&sh("cat .env.local private/notes.txt ../../secret.txt; echo PRIVATE=[$(ls -A private)]")).await;
+        for secret in ["ROOT-ENV", "PRIVATE-NOTES", "HOME-SECRET"] {
+            assert!(!out.contains(secret), "{secret}: {out}");
+        }
+        assert!(out.contains("PRIVATE=[]"), "{out}");
+
+        // The project itself is as it was.
+        assert_eq!(std::fs::read_to_string(root.join("source.txt")).unwrap(), "SOURCE");
+        assert_eq!(std::fs::read_to_string(root.join("nested/.env.production")).unwrap(), "KEY=NESTED-ENV");
+        assert!(!root.join("new.txt").exists());
+        assert!(!root.join(".git/hooks/pre-commit").exists());
+        assert!(!dir.path().join("home/planted.txt").exists());
+
+        // The layer goes when the run says so, unreadable overlay work directory included.
+        tool.sandbox.discard_run_files();
+        assert!(!scratch.exists(), "the scratch directory is deleted");
+    }
+
+    /// Every command is a jail of its own, so an empty /tmp per command would
+    /// forget the notes and snapshots an agent keeps between its steps.
+    #[tokio::test]
+    async fn tmp_lasts_from_one_command_to_the_next_and_goes_with_the_run() {
+        for writes in [Writes::Refused, Writes::Project, Writes::Scratch] {
+            let Some((dir, tool)) = jailed(writes, Duration::from_secs(20), &[], &[]) else { return };
+            let run_dir = tool.sandbox.jail().unwrap().run_dir().to_path_buf();
+            let out = tool.run(&sh("echo snapshot > /tmp/note && mkdir -p /tmp/deep/er && echo ok")).await;
+            assert!(out.contains("ok"), "{writes:?}: {out}");
+            let out = tool.run(&sh("cat /tmp/note; ls /tmp | tr '\\n' ' '")).await;
+            assert!(out.contains("snapshot"), "{writes:?}: {out}");
+            // It is this run's alone: not the machine's /tmp, and not the project.
+            assert!(!out.contains("clankistrator-run-"), "the run's own directory is not visible from inside: {out}");
+            assert!(run_dir.join("tmp/note").exists());
+            assert!(!dir.path().join("home/dev/project/note").exists());
+
+            tool.sandbox.discard_run_files();
+            assert!(!run_dir.exists(), "{writes:?}: deleted with the run");
+        }
+    }
+
+    #[tokio::test]
+    async fn scratch_commands_take_turns() {
+        let Some((_dir, tool)) = jailed(Writes::Scratch, Duration::from_secs(30), &[], &[]) else { return };
+        let tool = std::sync::Arc::new(tool);
+        let step = |name: &'static str| {
+            let tool = tool.clone();
+            tokio::spawn(async move {
+                tool.run(&sh(&format!("echo {name}-start >> order; sleep 0.4; echo {name}-end >> order"))).await
+            })
+        };
+        let (first, second) = (step("a"), step("b"));
+        for out in [first.await.unwrap(), second.await.unwrap()] {
+            assert!(out.starts_with("Command succeeded."), "{out}");
+        }
+        let out = tool.run(&sh("tr '\\n' ' ' < order")).await;
+        assert!(
+            out.contains("a-start a-end b-start b-end") || out.contains("b-start b-end a-start a-end"),
+            "one command finished before the other began: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scratch_layer_is_deleted_after_a_timeout_and_when_the_sandbox_goes() {
+        let Some((_dir, tool)) = jailed(Writes::Scratch, Duration::from_secs(1), &[], &[]) else { return };
+        let root = tool.sandbox.root().to_path_buf();
+        let scratch = tool.sandbox.jail().unwrap().run_dir().to_path_buf();
+        let out = tool.run(&sh(&format!("({BEAT}) & {BEAT}"))).await;
+        assert!(out.contains("timed out after 1 seconds"), "{out}");
+        assert!(scratch.join("upper/beat").exists(), "the command wrote into the layer");
+        assert!(!still_beating(&scratch.join("upper/beat")).await, "nothing is left running");
+        assert!(!root.join("beat").exists());
+
+        // Nobody called discard_run_files: dropping the last sandbox is enough.
+        drop(tool);
+        assert!(!scratch.exists(), "the scratch directory is deleted with the sandbox");
+    }
+
+    /// What a cancelled run does: stop the commands, then delete the layer at
+    /// once, while the command that was writing into it is still dying.
+    #[tokio::test]
+    async fn a_scratch_layer_is_deleted_under_a_command_that_is_still_running() {
+        let Some((_dir, tool)) = jailed(Writes::Scratch, Duration::from_secs(60), &[], &[]) else { return };
+        let sandbox = tool.sandbox.clone();
+        let scratch = sandbox.jail().unwrap().run_dir().to_path_buf();
+        let beat = scratch.join("upper/beat");
+        let call = tokio::spawn(async move { tool.run(&sh(&format!("({BEAT}) & {BEAT}"))).await });
+        while !beat.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        sandbox.stop_commands();
+        sandbox.discard_run_files();
+        tokio::time::timeout(Duration::from_secs(10), call).await.expect("the command ends when stopped").unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!scratch.exists(), "the layer does not come back, and nothing is left writing into it");
+        assert!(!sandbox.root().join("beat").exists());
+    }
+
+    #[tokio::test]
+    async fn a_scratch_run_in_a_worktree_cannot_write_to_the_repository_it_belongs_to() {
+        if crate::tools::jail::probe().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main"])
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .is_ok_and(|out| out.status.success())
+        };
+        std::fs::create_dir_all(base.join("main")).unwrap();
+        if !git(&base.join("main"), &["init", "-q"])
+            || !git(&base.join("main"), &["commit", "-q", "--allow-empty", "-m", "first commit"])
+            || !git(&base.join("main"), &["worktree", "add", "-q", "../tree"])
+        {
+            return; // git is not installed, or too old for worktrees
+        }
+        let policy = crate::tools::JailPolicy { home: Some(base.join("home")), ..Default::default() };
+        let sandbox =
+            Sandbox::new(base.join("tree"), Duration::from_secs(20)).unwrap().jailed(policy, Writes::Scratch).unwrap();
+        let tool = ExecuteCommand { sandbox };
+        let out = tool.run(&args("git", &["log", "--oneline"])).await;
+        assert!(out.starts_with("Command succeeded.") && out.contains("first commit"), "{out}");
+        let planted = base.join("main/.git/planted");
+        let out = tool.run(&sh(&format!("echo x > {}", planted.display()))).await;
+        assert!(out.contains("Read-only file system"), "{out}");
+        assert!(!planted.exists());
     }
 }
