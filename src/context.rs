@@ -264,6 +264,10 @@ pub struct ProjectContext {
     /// Model for reviews and the design check; the worker model if unset.
     #[serde(default)]
     pub review_model: Option<String>,
+    /// Further review models. A task is reviewed by a model from another
+    /// provider than the one that built it, when the reviewers offer one.
+    #[serde(default)]
+    pub other_review_models: Vec<String>,
     #[serde(default)]
     pub phase: RunPhase,
     /// Whether the finished project is checked against the design document.
@@ -350,6 +354,7 @@ impl ProjectContext {
             brave_mode,
             model,
             review_model: None,
+            other_review_models: Vec::new(),
             phase: RunPhase::Starting,
             design_check_enabled: true,
             fix_rounds: DEFAULT_FIX_ROUNDS,
@@ -436,9 +441,32 @@ impl ProjectContext {
         format_tokens(self.input_tokens, self.cached_input_tokens, self.output_tokens)
     }
 
-    /// The model used for reviews and the design check.
+    /// The first review model. It does the design check, and every review
+    /// unless another reviewer suits a task better (`reviewer_for`).
     pub fn reviewer_model(&self) -> &str {
         self.review_model.as_deref().or(self.advisor_model.as_deref()).unwrap_or(&self.model)
+    }
+
+    /// Every review model, the first one first.
+    pub fn reviewers(&self) -> Vec<&str> {
+        let mut all = vec![self.reviewer_model()];
+        for model in &self.other_review_models {
+            if !all.contains(&model.as_str()) {
+                all.push(model);
+            }
+        }
+        all
+    }
+
+    /// Who reviews work built by `builder`: the first reviewer from a
+    /// different provider, so that a model's work is not judged by its own
+    /// family, which tends to share its blind spots. If every reviewer is from
+    /// the builder's provider, the first one.
+    pub fn reviewer_for(&self, builder: &str) -> &str {
+        let provider = |model: &str| crate::llm::resolve_model(model).0;
+        let built_by = provider(builder);
+        let reviewers = self.reviewers();
+        reviewers.iter().copied().find(|model| provider(model) != built_by).unwrap_or(reviewers[0])
     }
 
     /// Requirements the latest design check found unmet.
@@ -833,6 +861,22 @@ pub(crate) mod tests {
             TaskStatus::RequiresHumanApproval { output_summary: "did it".into() };
         assert!(ctx.approve("A"));
         assert!(ctx.all_terminal());
+    }
+
+    #[test]
+    fn a_reviewer_from_another_provider_is_preferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = context(dir.path());
+        ctx.review_model = Some("claude-sonnet-5-5".into());
+        // One reviewer: it reviews everything, its own family's work included.
+        assert_eq!(ctx.reviewer_for("claude-opus-5-5"), "claude-sonnet-5-5");
+
+        ctx.other_review_models = vec!["gpt-6.1-sol".into(), "claude-sonnet-5-5".into()];
+        assert_eq!(ctx.reviewers(), ["claude-sonnet-5-5", "gpt-6.1-sol"], "listed once each");
+        assert_eq!(ctx.reviewer_for("claude-opus-5-5"), "gpt-6.1-sol");
+        assert_eq!(ctx.reviewer_for("gpt-6-luna"), "claude-sonnet-5-5");
+        // A third provider's work goes to the first reviewer.
+        assert_eq!(ctx.reviewer_for("openrouter:cohere/north-mini-code:free"), "claude-sonnet-5-5");
     }
 
     #[test]

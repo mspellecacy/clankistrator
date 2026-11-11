@@ -77,7 +77,7 @@ The summary reports input tokens as one total, with the part read from the cache
 | `-S, --max-steps <N>` | 50 | Orchestration passes that ran or reviewed a task; 0 is unlimited. Waiting for approval costs nothing |
 | `--max-turns <N>` | 40 | Model turns (tool-call rounds) per worker attempt |
 | `--command-timeout <SECS>` | 300 | Time limit for a command started by an agent |
-| `--review-model <MODEL>` | the advisor, else `--model` | Model for reviews and the design check. A stronger model here is the cheapest way to a stricter gate |
+| `--review-model <MODEL[,MODEL]>` | the advisor, else `--model` | Model for reviews and the design check. A stronger model here is the cheapest way to a stricter gate. With several, each task is reviewed by the first one from another provider than its builder |
 | `--workers <MODEL,MODEL>` | only `--model` | Models that may build, cheapest first. See "An advisor and several worker models" |
 | `--advisor-model <MODEL>` | none | A stronger model that plans, assigns tasks to the worker models, advises after a failed attempt, and reviews unless `--review-model` is set |
 | `--fix-rounds <N>` | 2 | How many times unmet design requirements are turned into a fix task |
@@ -113,6 +113,8 @@ Model names go out of date. Providers retire models on a schedule (OpenAI shuts 
 
 Workers and reviewers can use different models, from different providers: `--model` builds, `--review-model` judges. A cheaper model that builds with a stronger one that reviews is a reasonable combination.
 
+`--review-model` takes several models, separated by commas. The first does the design check. Each task is then reviewed by the first of them that comes from a different provider than the model that built it, so with `--review-model claude-sonnet-5-5,gpt-6.1-sol` work built by an OpenAI model is judged by Claude and work built by a Claude model is judged by OpenAI. The point is that models of one family tend to share blind spots; it also spreads the requests over two accounts. If no reviewer is from another provider, the first one reviews. Tested against scripted models only: no live run has used two reviewers yet, and how strict a gate each model makes is something to find out per model (see Limitations).
+
 #### An advisor and several worker models
 
 One strong model can lead a run while cheaper ones do the building:
@@ -130,7 +132,7 @@ cargo run --release -- --design design.md --output ../my-project \
 - **Advice after a failure.** When an attempt fails (the reviewer found something unmet, or the worker gave up), the advisor reads the project (it has no file-writing tools) and writes guidance for the next attempt: the cause and the exact change. It can also move the task to another worker model. It is consulted before every retry, and before the first new attempt at a task that an earlier run gave up on (`--resume`). Its answers are kept in `.clankistrator/transcripts/<task>.advice.*.md`.
 - **A model that stops working** during a run (a used-up free allowance, a revoked key) is left out for the rest of the run, and its task goes to the next model without losing an attempt. If no worker model is left, the remaining tasks fail; building never moves to a model that was not listed as a worker. A rate limit or an overloaded provider does not count as "stopped working".
 - **Fix tasks** from the design check go to the last model in the list, because they are what the earlier work missed.
-- **Reviews** are done by the advisor unless `--review-model` names another model.
+- **Reviews** are done by the advisor unless `--review-model` names another model, or several (see above).
 
 The run summary lists calls, tokens and passed and failed attempts per model, so you can see where the work went and what was paid for. (For a project started with an older version, the per-model lines begin with the first resumed run, while the totals cover everything.) Each consultation is a multi-turn run of your most expensive model; that is the price of the cheaper models' failures. A review whose only problem is that the reviewer did not show its evidence is not treated as a failure of the worker: no advice is asked and the task stays where it is.
 

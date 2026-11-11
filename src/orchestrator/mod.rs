@@ -953,7 +953,7 @@ impl Orchestrator {
         }
 
         // 2. Review
-        let to_review: Vec<(ProjectTask, String)> = {
+        let to_review: Vec<(ProjectTask, String, String)> = {
             let mut ctx = context.lock().await;
             // A crashed worker leaves its task InProgress; put it back in the queue.
             for t in ctx.tasks.iter_mut().filter(|t| t.status == TaskStatus::InProgress) {
@@ -965,34 +965,37 @@ impl Orchestrator {
                 };
             }
             let mut to_review = Vec::new();
-            for t in ctx.tasks.iter_mut() {
-                if let TaskStatus::ReadyForReview { output_summary } = &t.status {
+            for index in 0..ctx.tasks.len() {
+                if let TaskStatus::ReadyForReview { output_summary } = &ctx.tasks[index].status {
                     let summary = output_summary.clone();
+                    let builder = ctx.tasks[index].attempt_model.clone().unwrap_or_else(|| ctx.model.clone());
+                    let reviewer = ctx.reviewer_for(&builder).to_string();
+                    let t = &mut ctx.tasks[index];
                     t.status = TaskStatus::Reviewing { output_summary: summary.clone() };
-                    to_review.push((t.clone(), summary));
+                    to_review.push((t.clone(), summary, reviewer));
                 }
             }
             to_review
         };
 
         let mut reviewing = JoinSet::new();
-        for (task, summary) in to_review {
+        for (task, summary, reviewer) in to_review {
             let llm = Arc::clone(&self.llm);
             let semaphore = Arc::clone(&self.semaphore);
-            let settings = settings.clone();
+            let settings = AgentSettings { review_model: reviewer, ..settings.clone() };
             report.reviewed += 1;
             reviewing.spawn(async move {
                 let _permit = semaphore.acquire().await.expect("semaphore is never closed");
                 let run = agents::review_task(llm.as_ref(), &task, &summary, &settings).await;
-                (task.id, summary, run)
+                (task.id, summary, settings.review_model, run)
             });
         }
         while let Some(joined) = reviewing.join_next().await {
             let mut ctx = context.lock().await;
             match joined {
-                Ok((task_id, summary, run)) => {
+                Ok((task_id, summary, reviewer, run)) => {
                     save_transcript(self.sandbox.root(), &format!("{task_id}.review"), run.reply.as_deref());
-                    record_usage(&mut ctx, &settings.review_model, run.usage, run.calls);
+                    record_usage(&mut ctx, &reviewer, run.usage, run.calls);
                     apply_review(&mut ctx, &task_id, summary, run.outcome);
                 }
                 Err(e) => tracing::error!("Orchestrator: a reviewer crashed: {e}"),
@@ -1495,6 +1498,38 @@ mod tests {
         assert_eq!(workers[0].model, "test-model");
         assert_eq!(workers[1].model, "other-model");
         assert_eq!(llm.requests(Kind::Review)[1].model, "other-model");
+    }
+
+    /// With several review models, work is judged by one from another provider
+    /// than its builder; the design check stays with the first.
+    #[tokio::test]
+    async fn work_is_reviewed_by_a_model_from_another_provider_when_there_is_one() {
+        let llm = ScriptedLlm::new(|kind, request, earlier| match kind {
+            Kind::Plan => Ok(r#"[
+                {"id":"TASK-1","title":"One","description":"First","dependencies":[],"assigned_role":"Backend",
+                 "acceptance_criteria":["Cargo.toml exists in the project root"],"model":"claude-builder"},
+                {"id":"TASK-2","title":"Two","description":"Second","dependencies":["TASK-1"],"assigned_role":"Backend",
+                 "acceptance_criteria":["README.md exists"],"model":"gpt-builder"}
+            ]"#
+            .to_string()),
+            _ => agreeable(kind, request, earlier),
+        });
+        let (_dir, orchestrator, context) = setup(llm.clone(), true, 50);
+        {
+            let mut ctx = context.lock().await;
+            ctx.worker_models = vec!["claude-builder".into(), "gpt-builder".into()];
+            ctx.review_model = Some("claude-judge".into());
+            ctx.other_review_models = vec!["gpt-judge".into()];
+        }
+
+        assert_eq!(orchestrator.run(&context, Hitl::Stdin).await.unwrap(), RunEnd::Finished);
+        assert_eq!(worker_models(&llm), ["claude-builder", "gpt-builder"]);
+        let reviewers: Vec<String> = llm.requests(Kind::Review).iter().map(|r| r.model.clone()).collect();
+        assert_eq!(reviewers, ["gpt-judge", "claude-judge"]);
+        assert!(llm.requests(Kind::DesignCheck).iter().all(|r| r.model == "claude-judge"));
+        let ctx = context.lock().await;
+        assert!(ctx.succeeded());
+        assert_eq!(ctx.model_usage["gpt-judge"].calls, 1, "each reviewer's use is counted under its own name");
     }
 
     #[tokio::test]

@@ -71,9 +71,11 @@ struct Args {
     #[arg(long, default_value_t = 300)]
     command_timeout: u64,
 
-    /// Model for reviews and the design check, if it should differ from --model
-    #[arg(long)]
-    review_model: Option<String>,
+    /// Model for reviews and the design check, if it should differ from --model.
+    /// Several, comma-separated: the first does the design check, and each task
+    /// is reviewed by the first one from another provider than its builder
+    #[arg(long, value_delimiter = ',', value_name = "MODEL,MODEL")]
+    review_model: Vec<String>,
 
     /// A stronger model that leads the run: it plans, assigns each task to one of the --workers
     /// models, and reviews unless --review-model names another model
@@ -225,8 +227,9 @@ async fn run() -> Result<ExitCode> {
             ctx.max_turns = max_turns;
         }
         ctx.brave_mode |= args.brave;
-        if args.review_model.is_some() {
-            ctx.review_model = args.review_model.clone();
+        if let Some((first, others)) = args.review_model.split_first() {
+            ctx.review_model = Some(first.clone());
+            ctx.other_review_models = others.to_vec();
         }
         if let Some(fix_rounds) = args.fix_rounds {
             ctx.fix_rounds = fix_rounds;
@@ -250,14 +253,17 @@ async fn run() -> Result<ExitCode> {
         );
         ctx.worker_models = worker_pool(&args).unwrap_or_default();
         ctx.advisor_model = args.advisor_model.clone();
-        ctx.review_model = args.review_model.clone();
+        ctx.review_model = args.review_model.first().cloned();
+        ctx.other_review_models = args.review_model.iter().skip(1).cloned().collect();
         ctx.fix_rounds = args.fix_rounds.unwrap_or(DEFAULT_FIX_ROUNDS);
         ctx.design_check_enabled = !args.skip_design_check;
         ctx
     };
 
     check_credentials(context.planner_model())?;
-    check_credentials(context.reviewer_model())?;
+    for model in context.reviewers() {
+        check_credentials(model)?;
+    }
     for model in context.pool() {
         check_credentials(model)?;
     }
@@ -294,7 +300,7 @@ async fn run() -> Result<ExitCode> {
             "Clankistrator: worker models, cheapest first: {}. Planning by {}, reviews by {}",
             context.pool().join(", "),
             context.planner_model(),
-            context.reviewer_model()
+            context.reviewers().join(", ")
         );
     }
 
@@ -312,8 +318,9 @@ async fn run() -> Result<ExitCode> {
     let llm = RigLlm { prompt_caching: !args.no_prompt_cache };
     let mut context = context;
     let pool: Vec<String> = context.pool().iter().map(|m| m.to_string()).collect();
-    // Models the run cannot do without: the planner and the reviewer.
-    let required = [context.planner_model().to_string(), context.reviewer_model().to_string()];
+    // Models the run cannot do without: the planner and the reviewers.
+    let mut required = vec![context.planner_model().to_string()];
+    required.extend(context.reviewers().iter().map(|model| model.to_string()));
     let is_free = |model: &str| llm::uses_free_tier(&[model]);
 
     if pool.iter().chain(&required).any(|model| is_free(model)) {
@@ -322,7 +329,7 @@ async fn run() -> Result<ExitCode> {
                 // The free models are out for today. Go on without them if the run can.
                 let has_other_workers = pool.iter().any(|model| !is_free(model));
                 // The reviewer is always needed; the planner only while there is no plan yet.
-                let needed = is_free(context.reviewer_model())
+                let needed = context.reviewers().iter().any(|model| is_free(model))
                     || (context.tasks.is_empty() && is_free(context.planner_model()));
                 if !has_other_workers || needed {
                     bail!("{}", llm::FREE_ALLOWANCE_USED_UP);
@@ -579,7 +586,7 @@ async fn run_check(args: &Args, design_content: String) -> Result<ExitCode> {
         bail!("--check needs an existing project directory, but {} is not one", args.output.display());
     }
     let model = args.model.clone().unwrap_or_else(default_model);
-    let review_model = args.review_model.clone().unwrap_or_else(|| model.clone());
+    let review_model = args.review_model.first().cloned().unwrap_or_else(|| model.clone());
     check_credentials(&review_model)?;
     tracing_subscriber::fmt().with_env_filter(env_filter()).init();
 

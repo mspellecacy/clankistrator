@@ -323,7 +323,7 @@ fn draw_stats(frame: &mut Frame, ctx: &ProjectContext, area: Rect) {
         field("Model:         ", ctx.model.clone()),
         field("Workers:       ", ctx.pool().join(", ")),
         field("Advisor:       ", ctx.advisor_model.clone().unwrap_or_else(|| "none".into())),
-        field("Reviewer:      ", ctx.reviewer_model().to_string()),
+        field("Reviewer:      ", ctx.reviewers().join(", ")),
         field("Brave mode:    ", if ctx.brave_mode { "on".into() } else { "off".into() }),
         field("Output:        ", ctx.working_directory.display().to_string()),
         Line::from(""),

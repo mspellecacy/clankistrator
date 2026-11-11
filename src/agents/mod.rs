@@ -821,7 +821,7 @@ pub async fn review_task(
         files,
     );
 
-    tracing::info!("Reviewer [{}]: starting", task.id);
+    tracing::info!("Reviewer [{}]: starting on {}", task.id, settings.review_model);
     let run = verify_items(llm, subject, &review_items(task), REVIEW_MAX_TURNS, settings).await;
     AgentRun {
         outcome: run.outcome.map(|findings| verdict_from(&findings)),
