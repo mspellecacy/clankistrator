@@ -27,10 +27,19 @@ Agents write files and run programs on your machine. Know what the guard rails a
 - File tools are confined to the output directory. Absolute paths outside it, `..` escapes and symlinks leading out are refused.
 - Commands run with the output directory as the working directory, with no stdin, with your provider API keys removed from their environment, and are killed (with their child processes) after `--command-timeout` seconds. Process-group cleanup is implemented for Unix only.
 - Choose an output directory that is not inside another project (the examples use `../sumcli`, next to this repository). Build tools and version control search parent directories for their project files. Clankistrator refuses a `cargo` command that would fall through to a `Cargo.toml` outside the output directory, stops `git` from seeing an enclosing repository, and warns at startup when the output directory is nested in a project, but other tools (npm, go, pytest) are not guarded.
-- **Commands are not sandboxed.** They are ordinary processes running as you, and a program can touch anything you can. Clankistrator starts no shell itself, but a model can ask for `sh -c "..."` or `python3 -c "..."` and gets it. Building generated code also runs its build scripts. Use a container or a throwaway account if that matters to you.
+- **Commands in an ordinary run are not sandboxed.** (Those of `run_agent` are: see the last point.) They are ordinary processes running as you, and a program can touch anything you can. Clankistrator starts no shell itself, but a model can ask for `sh -c "..."` or `python3 -c "..."` and gets it. Building generated code also runs its build scripts. Use a container or a throwaway account if that matters to you.
 - **What a command prints goes to the model's provider.** That includes anything it reads outside the output directory, and your `.env.local` is an ordinary file a command could read. In one live run a reviewer wanted a dependency's source, ran `find /` over the whole machine until the timeout five minutes later, and then read files under `~/.cargo/registry`. In the 13 saved run logs, one other command pointed outside its project: a `grep` over `/root/.cargo/registry/src`, a path that does not exist here. None touched `.env.local` or anything else under the home directory. Reviewers, the advisor and the command tool are now told to stay inside the project; that is an instruction to the model, not a barrier.
-- **Reviewers and the advisor are not given the file-writing tools,** but they can run commands, and nothing stops a command from changing a file.
+- **Reviewers and the advisor are not given the file-writing tools** (`write_file` and `edit_file`), but they can run commands, and nothing stops a command from changing a file.
 - Without `--brave` nothing counts as done until you approve it, but the work has already been written and run by then. Approval gates progress, not execution.
+- **`run_agent` (the MCP server with `--delegate`) works in a project you already have,** so more is at stake than in an output directory. Its agents run on the models you name on the server's command line and no others, and their file tools refuse environment files (`.env`, `.envrc`, `.env.*` other than `.env.example`, `.env.sample` and `.env.template`). Their commands run in a jail built with [bubblewrap](https://github.com/containers/bubblewrap) (Linux only), and a `--delegate` server does not start where it cannot build one unless you pass `--no-jail`. In the jail:
+  - the project is the only part of your files that is there, read-only unless the call gave `write_access`;
+  - your home directory is empty apart from the paths you name with `--allow-read`, so there are no SSH keys, no CLI logins and no other projects;
+  - environment files in the project cannot be opened, and the paths you name with `--hide` are empty (the file tools refuse those too);
+  - there is no network unless you pass `--allow-network`, no Docker socket, and none of the session's sockets (SSH agent, keyring, D-Bus);
+  - the environment is a short list of harmless variables, and the server's own environment, which holds the provider keys, cannot be read through `/proc`;
+  - with `write_access`, `.git/hooks`, `.git/config` and `.claude/settings.local.json` stay read-only, and the file tools refuse to write them: they run code later, outside the jail, and never show in a diff. If `.claude/settings.local.json` does not exist, the whole `.claude` directory is read-only to commands, because a file that is not there cannot be covered. That list is not everything that runs later: `node_modules`, build output, a submodule's own git directory and every other path git ignores stay writable, and none of them shows in a diff either. Give `write_access` only where you would let that model loose with a shell in that one directory.
+
+  What the jail does not do: it does not decide what the model's provider gets to see (everything the agent reads in the project goes there), it finds environment files by a bounded walk (six levels deep, skipping `.git`, `node_modules`, `target` and other build directories), and it leaves the rest of the machine outside your home directory readable, as any local user could read it. With `--allow-network`, commands reach everything your machine reaches, including services on localhost. If the client is Claude Code, the project's permission rules and hooks still apply only to Claude's own tool calls; for an agent's commands the jail stands in for them. With `--no-jail`, commands are as unguarded as in an ordinary run: `sh -c 'cat .env.production'` works, and so does `git push`.
 
 ## Getting started
 
@@ -87,6 +96,12 @@ The summary reports input tokens as one total, with the part read from the cache
 | `--resume` | off | Continue the run saved in the output directory. Interrupted and failed tasks are queued again |
 | `--probe <MODEL>...` | | Test the given models (one request and one tool call each) instead of running |
 | `--mcp-server` | off | Run as an MCP server instead (see below) |
+| `--delegate` | off | With `--mcp-server`: also offer `run_agent`, which runs agents in a project for the MCP client (see below) |
+| `--env-file <FILE>` | none | Read settings from this file instead of `.env.local` and `.env` in the current directory |
+| `--no-jail` | off | With `--delegate`: run agents' commands as ordinary processes instead of in a bubblewrap jail. Without it, the server does not start where it cannot build a jail |
+| `--allow-network` | off | With `--delegate`: let jailed commands use the network |
+| `--allow-read <PATH,PATH>` | none | With `--delegate`: absolute paths outside the project that jailed commands may read, such as a toolchain under your home directory |
+| `--hide <PATH,PATH>` | none | With `--delegate`: paths in the project, relative to its root, that agents may not see |
 
 Headless exit codes: 0 if every task completed and the design check found nothing unmet; 1 if a task failed, a design requirement is unmet, the design check could not be completed, or the run could not start; 2 if the step limit stopped it; 130 on Ctrl-C.
 
@@ -188,7 +203,44 @@ Stats shows the token counts reported by the provider, including how many input 
 - `plan_tasks`: produce the validated task graph for a design document. This calls the model.
 - `project_status`: read the saved state of a run from its output directory.
 
-The server does not execute tasks, run commands or write files.
+Started like this, the server does not execute tasks, run commands or write files.
+
+### Running agents for an MCP client
+
+With `--delegate` the server offers a fourth tool, `run_agent`, which does run commands and change files. It lets the client (Claude Code, say) hand a piece of work in an existing repository to a model of your choosing: one agent, one prompt, a fresh context, and its final reply back. There is no design document, no plan and no review; the client is the orchestrator.
+
+```bash
+clankistrator --mcp-server --delegate \
+  --env-file ~/dev/clankistrator/.env.local \
+  --workers gpt-6-luna,claude-sonnet-5-5 \
+  --max-turns 80 --command-timeout 900 \
+  --allow-read ~/.nvm/versions/node/v25.2.0 \
+  --hide supabase/.temp,tmp/private
+```
+
+| Argument | Meaning |
+| --- | --- |
+| `directory` | Absolute path of the project. It must be the root of the repository or of a worktree, because commands cannot see a repository above the directory they run in. It is never created |
+| `prompt` | The task |
+| `agent` | The agent's standing instructions: a Markdown (`.md`) file, or a bare name looked up as `.claude/agents/<name>.md` in the directory. Front matter is ignored |
+| `model` | One of the server's models. Defaults to the first |
+| `write_access` | Also give the agent `write_file` and `edit_file`. Off by default |
+| `report_path` | A file inside the directory for the agent's report. If the agent does not write it, its final reply is saved there |
+| `max_turns` | Model turns for this call, instead of the server's `--max-turns` |
+
+What to know:
+
+- **The models are yours to choose, not the client's.** An agent runs only on a model named with `--model`, `--workers`, `--review-model` or `--advisor-model` when the server was started. `$DEFAULT_MODEL` and the built-in fallback do not count, and a `--delegate` server with no model named does not start. What an agent reads goes to its model's provider, so this list is also the list of providers that may see the project.
+- **Settings do not come from the current directory.** A client usually starts the server inside the project the agents will work on, where `.env.local` is the project's own: reading it would bill the project's provider key and pass its settings on to every command. A `--delegate` server reads the environment and `--env-file`, nothing else.
+- **Agent files written for Claude Code mostly work as they are.** The agent is told which tools it has here and which of Claude Code's they stand for. It has no skills, slash commands, subagents or MCP tools, and is told to stop and say so if its instructions need one, so an agent that only wraps `/code-review` cannot be delegated.
+- **Nothing is written to the project** except what the agent writes and the report: no `.clankistrator/` directory, no transcripts.
+- **A failed run** (a provider error, or all turns used without a final reply) writes no report and leaves an earlier one alone. The files may be half changed; the error says so.
+- **One agent, started once.** A request that a provider turns away for a passing reason is sent again, as everywhere. An agent that fails is not started again: a second one would begin with an empty context on files the first had half changed. An agent run ends after 30 minutes at the latest.
+- **Stopping.** When the client cancels the call (MCP's `notifications/cancelled`) or goes away (its end of stdin closes), the agent is stopped and the commands it started are killed. While an agent works, the server keeps answering other requests and, if the client asked for progress, sends it a progress notification every minute, so that a long run is not taken for a dead one. Whether Claude Code sends that cancellation when you interrupt it, and whether it asks for progress, has not been observed; the server's log (stderr) says both for each run.
+- **Commands are jailed** (see Safety). A toolchain installed under your home directory, such as node from nvm or cargo from rustup, is not there until you name it with `--allow-read`; a command that needs it fails with "No such file or directory". What the jail allows is settled on the server's command line, and no argument of `run_agent` loosens it. A `report_path` under a hidden path is refused.
+- **Run live on 2026-11-11, from Claude Code.** A reviewer agent file written for Claude Code ran unchanged against a private repository on `claude-haiku-5-5` and on `gpt-6-luna`, and both returned a report in the format the file asks for. Those two runs were before the jail existed, inside a bubblewrap wrapper around the whole server. With the jail, two canary agents on `claude-haiku-5-5` then tried what it forbids. Read-only: creating a file, reading environment files, listing the home directory, Docker, the network and the server's environment through `/proc` all failed, while `git diff` and `node` worked and a 25-second command ran to its end. With `write_access`, in a scratch repository: writing files and `git commit` worked, and `.git/hooks`, `.git/config` and `.claude/settings.local.json` could not be written by a command or by `write_file`. A worktree has only been run in tests, and `--allow-network` not through an agent at all: only its mounts were tried by hand, where a name resolved and an HTTPS request went through.
+
+Agents also get `edit_file`, which replaces one piece of text in a file. Workers in an ordinary run have it too.
 
 ## Writing a design document
 
@@ -216,6 +268,7 @@ src/
 ├── context.rs         Tasks, statuses, graph validation, saved state
 ├── llm.rs             Provider selection and the single call into rig
 ├── agents/            Worker and reviewer prompts, reply parsing
+├── delegate.rs        One agent on one prompt in an existing project (run_agent)
 ├── orchestrator/      Planning, the run loop, system prompts
 ├── tools/             Sandboxed file tools and command execution
 ├── tui/               Terminal UI

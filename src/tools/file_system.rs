@@ -122,6 +122,97 @@ impl Tool for WriteFile {
 }
 
 #[derive(Deserialize, Serialize)]
+pub struct EditFileArgs {
+    pub path: String,
+    pub old_text: String,
+    pub new_text: String,
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
+/// Changes part of a file, so that a small change to a large file does not
+/// mean writing the whole file out again (and getting the rest of it wrong).
+pub struct EditFile {
+    pub sandbox: Sandbox,
+}
+
+impl EditFile {
+    fn edit(&self, args: &EditFileArgs) -> Result<String, String> {
+        let path = self.sandbox.resolve_for_write(&args.path)?;
+        if args.old_text.is_empty() {
+            return Err("old_text is empty. To create a file, use write_file.".to_string());
+        }
+        if args.old_text == args.new_text {
+            return Err("old_text and new_text are the same, so nothing would change.".to_string());
+        }
+        let content =
+            fs::read_to_string(&path).map_err(|e| format!("could not read {} as text: {e}", args.path))?;
+        let found = content.matches(&args.old_text).count();
+        match found {
+            0 => Err(format!(
+                "old_text was not found in {}. It must match the file exactly, including indentation \
+                 and line breaks. Read the file again and copy the text from it.",
+                args.path
+            )),
+            1 => Ok(()),
+            _ if args.replace_all => Ok(()),
+            _ => Err(format!(
+                "old_text occurs {found} times in {}. Include more of the surrounding lines so that it \
+                 matches one place, or set replace_all to change every occurrence.",
+                args.path
+            )),
+        }?;
+        fs::write(&path, content.replace(&args.old_text, &args.new_text))
+            .map_err(|e| format!("failed to write {}: {e}", args.path))?;
+        Ok(format!("Replaced {found} occurrence{} in {}", if found == 1 { "" } else { "s" }, args.path))
+    }
+}
+
+impl Tool for EditFile {
+    const NAME: &'static str = "edit_file";
+    type Error = ToolError;
+    type Args = EditFileArgs;
+    type Output = String;
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        tracing::info!("Editing file: {}", args.path);
+        Ok(self.edit(&args).unwrap_or_else(|e| format!("Error: {e}")))
+    }
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Change part of an existing file by replacing one piece of text with another. \
+                          Prefer this to write_file for a change to an existing file. \
+                          Paths are relative to the project root."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path of the file, relative to the project root (e.g. 'src/main.rs')."
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "The text to replace, copied exactly from the file, including indentation. It must occur exactly once unless replace_all is set."
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "The text to put in its place. Empty removes old_text."
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every occurrence of old_text instead of requiring exactly one. Defaults to false."
+                    }
+                },
+                "required": ["path", "old_text", "new_text"]
+            }),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
 pub struct ListFilesArgs {
     #[serde(default = "default_directory")]
     pub directory: String,
@@ -231,5 +322,47 @@ mod tests {
         let read = ReadFile { sandbox: sb };
         let out = read.call(ReadFileArgs { path: "/etc/hostname".into() }).await.unwrap();
         assert!(out.starts_with("Error:"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn edit_replaces_one_place_and_says_why_when_it_cannot() {
+        let (_dir, sandbox) = sandbox();
+        let path = sandbox.root().join("src/lib.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "fn a() {\n    1\n}\nfn b() {\n    1\n}\n").unwrap();
+        let tool = EditFile { sandbox: sandbox.clone() };
+        let edit = |old: &str, new: &str, replace_all: bool| {
+            tool.call(EditFileArgs {
+                path: "src/lib.rs".into(),
+                old_text: old.into(),
+                new_text: new.into(),
+                replace_all,
+            })
+        };
+
+        let done = edit("fn a() {\n    1", "fn a() {\n    2", false).await.unwrap();
+        assert_eq!(done, "Replaced 1 occurrence in src/lib.rs");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a() {\n    2\n}\nfn b() {\n    1\n}\n");
+
+        let unchanged = std::fs::read_to_string(&path).unwrap();
+        assert!(edit("    3", "    4", false).await.unwrap().contains("was not found"));
+        assert!(edit("fn ", "pub fn ", false).await.unwrap().contains("occurs 2 times"));
+        assert!(edit("", "x", false).await.unwrap().starts_with("Error"));
+        assert!(edit("fn a", "fn a", false).await.unwrap().starts_with("Error"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), unchanged, "a refused edit changes nothing");
+
+        assert_eq!(edit("fn ", "pub fn ", true).await.unwrap(), "Replaced 2 occurrences in src/lib.rs");
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with("pub fn a() {"));
+
+        let outside = tool
+            .call(EditFileArgs {
+                path: "../lib.rs".into(),
+                old_text: "a".into(),
+                new_text: "b".into(),
+                replace_all: false,
+            })
+            .await
+            .unwrap();
+        assert!(outside.starts_with("Error"), "{outside}");
     }
 }

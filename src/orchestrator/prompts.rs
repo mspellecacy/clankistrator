@@ -83,7 +83,7 @@ pub fn role_prompt(role: AgentRole) -> &'static str {
 
 pub const WORKER_RULES: &str = r#"
 How you work:
-- You have tools to read, list and write files and to run commands. You MUST use them to do the task; describing code in your reply does not create it.
+- You have tools to read, list, write and edit files and to run commands. You MUST use them to do the task; describing code in your reply does not create it. To change part of an existing file, use edit_file rather than writing the whole file again.
 - All tool paths are relative to the project root. Paths outside the project are rejected. Commands run in the directory you pass as working_dir ('.' is the project root).
 - The project root is the project itself: create Cargo.toml, src/ and so on directly in it, not in a subdirectory. For a Rust project use `cargo init` or write the files yourself; never `cargo new <name>`, which creates a subdirectory.
 - Other agents work on the same project. Look at what exists before you write, and do not undo their work.

@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod context;
+pub mod delegate;
 pub mod llm;
 pub mod mcp;
 pub mod orchestrator;
@@ -112,6 +113,38 @@ struct Args {
     #[arg(long)]
     mcp_server: bool,
 
+    /// With --mcp-server: also offer the run_agent tool, which lets the MCP client run an agent
+    /// that reads files, runs commands and, if asked, changes files in a project directory.
+    /// Agents run only on the models named with --model, --workers, --review-model and
+    /// --advisor-model. Settings are then not read from .env files in the current directory
+    #[arg(long, requires = "mcp_server")]
+    delegate: bool,
+
+    /// Read settings (API keys, DEFAULT_MODEL and so on) from this file instead of .env.local
+    /// and .env in the current directory
+    #[arg(long, value_name = "FILE")]
+    env_file: Option<PathBuf>,
+
+    /// With --delegate: run agents' commands as ordinary processes instead of in a bubblewrap
+    /// jail. Without this, the server does not start where it cannot build a jail
+    #[arg(long, requires = "delegate")]
+    no_jail: bool,
+
+    /// With --delegate: let jailed commands use the network
+    #[arg(long, requires = "delegate", conflicts_with = "no_jail")]
+    allow_network: bool,
+
+    /// With --delegate: paths outside the project that jailed commands may read, separated by
+    /// commas (a toolchain under your home directory, say). The rest of your home directory is
+    /// empty in the jail
+    #[arg(long, requires = "delegate", conflicts_with = "no_jail", value_delimiter = ',', value_name = "PATH,PATH")]
+    allow_read: Vec<PathBuf>,
+
+    /// With --delegate: paths in the project, relative to its root, that agents may not see,
+    /// separated by commas
+    #[arg(long, requires = "delegate", value_delimiter = ',', value_name = "PATH,PATH")]
+    hide: Vec<PathBuf>,
+
     /// Test the given models instead of orchestrating: one plain request and one
     /// tool call each. Uses no files and runs no commands
     #[arg(long, num_args = 1.., value_name = "MODEL", conflicts_with_all = ["resume", "mcp_server", "check"])]
@@ -160,17 +193,123 @@ fn main() -> ExitCode {
     code
 }
 
-async fn run() -> Result<ExitCode> {
-    dotenvy::from_filename(".env.local").ok();
-    dotenvy::dotenv().ok();
+/// Load settings from dotenv files. Variables already in the environment win.
+///
+/// A delegating MCP server is started by its client, usually inside the
+/// project the agents will work on, so `.env.local` in the current directory
+/// is that project's and not ours: reading it would bill model calls to the
+/// project's own provider key and hand every one of its settings to the
+/// commands agents run. Such a server takes its settings from the environment
+/// and from `--env-file` only.
+fn load_settings(env_file: Option<&std::path::Path>, delegate: bool) -> Result<()> {
+    match env_file {
+        Some(file) => {
+            // dotenvy's error repeats its cause, so it is not kept as one.
+            dotenvy::from_path(file).map_err(|e| anyhow::anyhow!("could not read --env-file {}: {e}", file.display()))?;
+        }
+        None if delegate => {}
+        None => {
+            dotenvy::from_filename(".env.local").ok();
+            dotenvy::dotenv().ok();
+        }
+    }
+    Ok(())
+}
 
+/// The jail for the commands of delegated agents, from the command line.
+/// `None` means the owner switched it off. A jail that cannot be built is an
+/// error: the server must not quietly run commands without one.
+fn jail_policy(args: &Args) -> Result<Option<tools::JailPolicy>> {
+    if args.no_jail {
+        tracing::warn!("--no-jail: agents' commands run as ordinary processes and can read whatever you can");
+        return Ok(None);
+    }
+    tools::jail::probe().map_err(|e| {
+        anyhow::anyhow!(
+            "{e}. run_agent is not offered without a jail for its commands; \
+             --no-jail runs them as ordinary processes instead"
+        )
+    })?;
+    let mut policy = tools::JailPolicy::for_current_user();
+    // Without a home directory to empty, the jail would leave the real one in place.
+    let Some(home) = policy.home.take() else {
+        bail!("$HOME is not set to an absolute path, so the jail cannot tell which directory to hide from commands");
+    };
+    // The jail is built from real paths: a symlinked home would not be covered.
+    policy.home = Some(home.canonicalize().with_context(|| format!("$HOME ({}) cannot be resolved", home.display()))?);
+    policy.network = args.allow_network;
+    for path in &args.allow_read {
+        if !path.is_absolute() {
+            bail!("--allow-read {} must be an absolute path", path.display());
+        }
+        match path.canonicalize() {
+            Ok(real) => policy.readable.push(real),
+            Err(e) => tracing::warn!("--allow-read {} is ignored: {e}", path.display()),
+        }
+    }
+    Ok(Some(policy))
+}
+
+/// The models named on the command line, each once, in the order given.
+fn named_models(args: &Args) -> Vec<String> {
+    let mut models: Vec<String> = Vec::new();
+    let named = args.model.iter().chain(&args.workers).chain(&args.review_model).chain(&args.advisor_model);
+    for model in named.map(|model| model.trim()).filter(|model| !model.is_empty()) {
+        if !models.iter().any(|known| known == model) {
+            models.push(model.to_string());
+        }
+    }
+    models
+}
+
+async fn run() -> Result<ExitCode> {
+    // Some options default to settings from the dotenv files, and which files
+    // to read is itself an option: so the command line is read twice.
+    let early = Args::parse();
+    load_settings(early.env_file.as_deref(), early.delegate)?;
     let args = Args::parse();
 
     if args.mcp_server {
         // stdout carries the protocol, so logs go to stderr.
         tracing_subscriber::fmt().with_env_filter(env_filter()).with_writer(std::io::stderr).init();
         let llm = RigLlm { prompt_caching: !args.no_prompt_cache };
-        let server = mcp::McpServer::new(Arc::new(llm), args.model.unwrap_or_else(default_model));
+        let mut server = mcp::McpServer::new(Arc::new(llm), args.model.clone().unwrap_or_else(default_model));
+        if args.delegate {
+            // $DEFAULT_MODEL and the built-in fallback do not count: an agent
+            // sends a project's code to its provider, and that has to be asked for.
+            let models = named_models(&args);
+            if models.is_empty() {
+                bail!(
+                    "--delegate needs to be told which models agents may run on: name them with --model \
+                     or --workers (the first is the default)"
+                );
+            }
+            models.iter().try_for_each(|model| check_credentials(model)).context(
+                "with --delegate, settings come from the environment and --env-file, \
+                 not from .env files in the current directory",
+            )?;
+            let jail = jail_policy(&args)?;
+            // Checked now, so that a mistyped --hide stops the server and not every call.
+            Sandbox::new(std::env::temp_dir(), Duration::from_secs(1))?
+                .hiding(&args.hide)
+                .map_err(|e| anyhow::anyhow!("--hide: {e}"))?;
+            tracing::info!(
+                "run_agent is offered, on: {}. Commands are {}",
+                models.join(", "),
+                match &jail {
+                    Some(jail) if jail.network => "jailed, with the network",
+                    Some(_) => "jailed, without a network",
+                    None => "NOT jailed",
+                }
+            );
+            server = server.delegating(mcp::Delegating {
+                models,
+                max_turns: args.max_turns.unwrap_or(DEFAULT_MAX_TURNS).max(1),
+                command_timeout: Duration::from_secs(args.command_timeout.max(1)),
+                jail,
+                hidden: args.hide.clone(),
+            });
+        }
         server.run().await?;
         return Ok(ExitCode::SUCCESS);
     }

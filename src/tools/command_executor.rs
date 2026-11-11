@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rig::completion::ToolDefinition;
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
-use crate::tools::{Sandbox, ToolError};
+use crate::tools::{CommandScope, Sandbox, ToolError};
 
 /// Per stream, the first and last this-many bytes of output are kept.
 const OUTPUT_HEAD_BYTES: usize = 4_000;
@@ -49,6 +49,9 @@ fn project_root() -> String {
 /// cargo subcommands that do not need an existing manifest.
 const CARGO_WITHOUT_MANIFEST: &[&str] =
     &["new", "init", "help", "version", "install", "uninstall", "search", "login", "logout"];
+
+/// What a command call returns once its agent's run has been stopped.
+const STOPPED: &str = "Command not run: this agent's run has been stopped.";
 
 pub struct ExecuteCommand {
     pub sandbox: Sandbox,
@@ -89,7 +92,7 @@ async fn read_capped(mut stream: impl AsyncRead + Unpin) -> String {
 /// Kill the command's whole process group, so that e.g. the binary started by
 /// `cargo run` dies along with cargo.
 #[cfg(unix)]
-fn kill_process_group(pid: Option<u32>) {
+pub(crate) fn kill_process_group(pid: Option<u32>) {
     if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
         // SAFETY: plain syscall; the pid is the id of a group we created with process_group(0).
         unsafe {
@@ -99,7 +102,7 @@ fn kill_process_group(pid: Option<u32>) {
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(_pid: Option<u32>) {}
+pub(crate) fn kill_process_group(_pid: Option<u32>) {}
 
 /// Process groups of commands that are running right now.
 static RUNNING: Mutex<Vec<u32>> = Mutex::new(Vec::new());
@@ -114,22 +117,32 @@ pub fn kill_running_commands() {
     }
 }
 
-/// Registers a running command and kills its group when dropped, which also
-/// covers the agent's task being cancelled mid-command.
-struct RunningCommand(Option<u32>);
+/// Registers a running command, with the program and with its sandbox, and
+/// kills its group when dropped, which also covers the future running the
+/// command being dropped mid-command.
+struct RunningCommand(Option<u32>, Arc<CommandScope>);
 
 impl RunningCommand {
-    fn new(pid: Option<u32>) -> Self {
-        if let (Some(pid), Ok(mut running)) = (pid, RUNNING.lock()) {
-            running.push(pid);
+    fn new(pid: Option<u32>, sandbox: &Sandbox) -> Self {
+        let scope = sandbox.commands().clone();
+        if let Some(pid) = pid {
+            if let Ok(mut running) = RUNNING.lock() {
+                running.push(pid);
+            }
+            if let Ok(mut pids) = scope.pids.lock() {
+                pids.push(pid);
+            }
         }
-        Self(pid)
+        Self(pid, scope)
     }
 }
 
 impl Drop for RunningCommand {
     fn drop(&mut self) {
         let Some(pid) = self.0 else { return };
+        if let Ok(mut pids) = self.1.pids.lock() {
+            pids.retain(|p| *p != pid);
+        }
         // Only kill what is still registered; kill_running_commands may have been here already.
         let registered = RUNNING
             .lock()
@@ -199,17 +212,20 @@ impl ExecuteCommand {
     }
 
     fn build_command(&self, args: &ExecuteCommandArgs, cwd: &Path) -> Command {
-        let mut cmd = Command::new(&args.command);
-        cmd.args(&args.args)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // Credentials that generated code and its build scripts have no business seeing.
-        for key in crate::llm::secret_env_vars() {
-            cmd.env_remove(key);
-        }
+        let mut cmd = match self.sandbox.jail() {
+            // The jail starts from an empty environment, so it has no credentials to remove.
+            Some(jail) => jail.command(self.sandbox.root(), self.sandbox.hidden(), &args.command, &args.args, cwd),
+            None => {
+                let mut cmd = Command::new(&args.command);
+                cmd.args(&args.args).current_dir(cwd);
+                // Credentials that generated code and its build scripts have no business seeing.
+                for key in crate::llm::secret_env_vars() {
+                    cmd.env_remove(key);
+                }
+                cmd
+            }
+        };
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         // Keep git from discovering a repository that encloses the output
         // directory; otherwise an agent's `git add`/`git commit` lands there.
         if let Some(parent) = self.sandbox.root().parent() {
@@ -230,6 +246,9 @@ impl ExecuteCommand {
         if let Some(refusal) = self.cargo_outside_project(args, &cwd) {
             return refusal;
         }
+        if self.sandbox.commands_stopped() {
+            return STOPPED.to_string();
+        }
         let mut cmd = self.build_command(args, &cwd);
 
         let mut child = match cmd.spawn() {
@@ -239,7 +258,11 @@ impl ExecuteCommand {
             }
         };
         let pid = child.id();
-        let running = RunningCommand::new(pid);
+        let running = RunningCommand::new(pid, &self.sandbox);
+        // Stopped between the check above and the registration: nobody else will kill it.
+        if self.sandbox.commands_stopped() {
+            kill_process_group(pid);
+        }
         let stdout = tokio::spawn(read_capped(child.stdout.take().expect("stdout is piped")));
         let stderr = tokio::spawn(read_capped(child.stderr.take().expect("stderr is piped")));
 
@@ -509,5 +532,250 @@ mod tests {
         }
         assert!(!alive(grandchild), "the process started by the command must not outlive it");
         assert!(RUNNING.lock().unwrap().iter().all(|p| *p as i32 != grandchild));
+    }
+
+    /// rig runs a tool call in a task of its own, so the command is not
+    /// dropped with the agent: it has to be stopped through its sandbox.
+    #[tokio::test]
+    async fn stopping_a_sandbox_kills_its_commands_and_refuses_new_ones() {
+        let (dir, tool) = tool(Duration::from_secs(60));
+        let sandbox = tool.sandbox.clone();
+        let (_other_dir, other) = self::tool(Duration::from_secs(60));
+        let marker = dir.path().join("out/pid");
+
+        let call = tokio::spawn(async move {
+            let output = tool.run(&args("sh", &["-c", "sleep 60 & echo $! > pid; wait"])).await;
+            (tool, output)
+        });
+        let grandchild = loop {
+            if let Ok(text) = std::fs::read_to_string(&marker)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        // SAFETY: signal 0 only checks that the process exists.
+        let alive = |pid: i32| unsafe { libc::kill(pid, 0) == 0 };
+        assert!(alive(grandchild));
+
+        sandbox.stop_commands();
+        let (tool, output) = tokio::time::timeout(Duration::from_secs(10), call)
+            .await
+            .expect("the command ends when its sandbox is stopped, long before its timeout")
+            .unwrap();
+        assert!(output.contains("terminated by a signal"), "{output}");
+        for _ in 0..100 {
+            if !alive(grandchild) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!alive(grandchild), "what the command started dies with it");
+
+        assert_eq!(tool.run(&args("echo", &["hi"])).await, STOPPED);
+        assert!(
+            other.run(&args("echo", &["hi"])).await.contains("Command succeeded"),
+            "another agent's sandbox is not affected"
+        );
+    }
+
+    /// A jailed tool for a project under a pretend home directory:
+    /// `<dir>/home/dev/project`. `None` where bubblewrap cannot build a jail.
+    fn jailed(
+        writable: bool,
+        timeout: Duration,
+        hidden: &[&str],
+        readable: &[&str],
+    ) -> Option<(tempfile::TempDir, ExecuteCommand)> {
+        if let Err(why) = crate::tools::jail::probe() {
+            eprintln!("skipped: {why}");
+            return None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap().join("home");
+        let root = home.join("dev/project");
+        for sub in [".git/hooks", ".claude", "private", "nested"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        std::fs::create_dir_all(home.join("tools")).unwrap();
+        for (file, text) in [
+            (home.join("secret.txt"), "HOME-SECRET"),
+            (home.join("tools/hello"), "TOOLCHAIN"),
+            (root.join("source.txt"), "SOURCE"),
+            (root.join(".env.local"), "KEY=ROOT-ENV"),
+            (root.join("nested/.env.production"), "KEY=NESTED-ENV"),
+            (root.join("private/notes.txt"), "PRIVATE-NOTES"),
+            (root.join(".git/config"), "[core]\n"),
+        ] {
+            std::fs::write(file, text).unwrap();
+        }
+        let policy = crate::tools::JailPolicy {
+            network: false,
+            readable: readable.iter().map(|path| home.join(path)).collect(),
+            home: Some(home),
+        };
+        let hidden: Vec<std::path::PathBuf> = hidden.iter().map(std::path::PathBuf::from).collect();
+        let sandbox =
+            Sandbox::new(&root, timeout).unwrap().hiding(&hidden).unwrap().jailed(policy, writable).unwrap();
+        Some((dir, ExecuteCommand { sandbox }))
+    }
+
+    fn sh(script: &str) -> ExecuteCommandArgs {
+        args("sh", &["-c", script])
+    }
+
+    #[tokio::test]
+    async fn a_jailed_command_sees_the_project_and_nothing_else_of_the_users() {
+        let Some((_dir, tool)) = jailed(false, Duration::from_secs(20), &["private"], &["tools"]) else { return };
+
+        let out = tool.run(&sh("cat source.txt && cat ../../tools/hello")).await;
+        assert!(out.contains("SOURCE") && out.contains("TOOLCHAIN"), "{out}");
+
+        // The home directory is empty, apart from what was allowed and the way to the project.
+        let out = tool.run(&sh("cat ../../secret.txt 2>/dev/null; echo HOME=$(ls ../.. | tr '\\n' ' ')")).await;
+        assert!(!out.contains("HOME-SECRET"), "{out}");
+        assert!(out.contains("HOME=dev tools\n"), "{out}");
+
+        // Environment files, wherever they are, and hidden paths.
+        let script = "cat .env.local nested/.env.production private/notes.txt; grep -rn KEY . ; echo PRIVATE=[$(ls -A private)]";
+        let out = tool.run(&sh(script)).await;
+        for secret in ["ROOT-ENV", "NESTED-ENV", "PRIVATE-NOTES"] {
+            assert!(!out.contains(secret), "{secret}: {out}");
+        }
+        assert!(out.contains("PRIVATE=[]"), "{out}");
+
+        // Read-only, and nothing of this process: not its environment, its /proc entry or its network.
+        let out = tool.run(&sh("echo x > new.txt")).await;
+        assert!(out.contains("Read-only file system"), "{out}");
+        assert!(!tool.sandbox.root().join("new.txt").exists());
+        let out = tool.run(&sh("env; echo PIDS=$(ls /proc | grep -c '^[0-9]'); echo NICS=$(grep -c : /proc/net/dev)")).await;
+        assert!(!out.contains("CARGO_PKG_NAME"), "the environment of this test must not leak in: {out}");
+        assert!(out.contains("NICS=1"), "only the loopback interface: {out}");
+        let pids: usize = out.split("PIDS=").nth(1).unwrap().lines().next().unwrap().parse().unwrap();
+        assert!(pids < 10, "a private process namespace: {out}");
+    }
+
+    #[tokio::test]
+    async fn a_writable_jail_lets_commands_change_the_project_but_not_what_runs_unseen() {
+        let Some((dir, tool)) = jailed(true, Duration::from_secs(20), &[], &[]) else { return };
+        let root = tool.sandbox.root().to_path_buf();
+
+        let out = tool.run(&sh("echo changed > source.txt && echo new > new.txt && mkdir -p .git/objects/ab")).await;
+        assert!(out.starts_with("Command succeeded."), "{out}");
+        assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "new\n");
+        assert_eq!(std::fs::read_to_string(root.join("source.txt")).unwrap(), "changed\n");
+
+        for script in [
+            "echo evil > .git/hooks/pre-commit",
+            "echo evil >> .git/config",
+            "echo evil > .claude/settings.local.json",
+        ] {
+            let out = tool.run(&sh(script)).await;
+            assert!(out.contains("Read-only file system"), "{script}: {out}");
+        }
+        // Nor by moving the directory above them aside and putting a writable one in its place.
+        for script in [
+            "mv .git .git-aside && mkdir -p .git/hooks && echo evil > .git/hooks/pre-commit",
+            "mv .claude .claude-aside && mkdir .claude && echo evil > .claude/settings.local.json",
+            "rm -rf .git/hooks && mkdir .git/hooks && echo evil > .git/hooks/pre-commit",
+        ] {
+            let out = tool.run(&sh(script)).await;
+            assert!(out.starts_with("Command failed"), "{script}: {out}");
+        }
+        assert!(!root.join(".git-aside").exists() && !root.join(".claude-aside").exists());
+        assert!(!root.join(".git/hooks/pre-commit").exists());
+        assert!(!root.join(".claude/settings.local.json").exists());
+        assert_eq!(std::fs::read_to_string(root.join(".git/config")).unwrap(), "[core]\n");
+
+        // The same, where the local settings file is already there: it is covered itself.
+        std::fs::write(root.join(".claude/settings.local.json"), "{}").unwrap();
+        let script = "echo evil > .claude/settings.local.json; mv .claude .claude-aside; echo ok > .claude/agent.md";
+        let out = tool.run(&sh(script)).await;
+        assert!(out.contains("Read-only file system"), "{out}");
+        assert_eq!(std::fs::read_to_string(root.join(".claude/settings.local.json")).unwrap(), "{}");
+        assert!(!root.join(".claude-aside").exists());
+        assert!(root.join(".claude/agent.md").exists(), "the rest of .claude can still be changed");
+
+        // Still no way to the rest of the home directory, to read or to write.
+        let out = tool.run(&sh("cat ../../secret.txt; echo x > ../../planted.txt; cat .env.local")).await;
+        assert!(!out.contains("HOME-SECRET") && !out.contains("ROOT-ENV"), "{out}");
+        assert!(!dir.path().join("home/planted.txt").exists());
+    }
+
+    /// Whether the loop a jailed command started is still appending to `beat`.
+    async fn still_beating(beat: &std::path::Path) -> bool {
+        let size = || std::fs::metadata(beat).map(|meta| meta.len()).unwrap_or(0);
+        let before = size();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        size() != before
+    }
+
+    const BEAT: &str = "while :; do echo x >> beat; sleep 0.05; done";
+
+    /// Processes in the jail leave our process group (`--new-session`) and
+    /// have pids of their own namespace, so the kill has to reach them
+    /// through bubblewrap.
+    #[tokio::test]
+    async fn a_jailed_command_that_times_out_dies_with_everything_it_started() {
+        let Some((_dir, tool)) = jailed(true, Duration::from_secs(1), &[], &[]) else { return };
+        let beat = tool.sandbox.root().join("beat");
+        let out = tool.run(&sh(&format!("({BEAT}) & {BEAT}"))).await;
+        assert!(out.contains("timed out after 1 seconds"), "{out}");
+        assert!(beat.exists(), "the command ran");
+        assert!(!still_beating(&beat).await, "nothing the command started is left running");
+    }
+
+    #[tokio::test]
+    async fn stopping_a_sandbox_kills_its_jailed_commands() {
+        let Some((_dir, tool)) = jailed(true, Duration::from_secs(60), &[], &[]) else { return };
+        let sandbox = tool.sandbox.clone();
+        let beat = sandbox.root().join("beat");
+        let call = tokio::spawn(async move { tool.run(&sh(&format!("({BEAT}) & {BEAT}"))).await });
+        while !beat.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(still_beating(&beat).await);
+
+        sandbox.stop_commands();
+        tokio::time::timeout(Duration::from_secs(10), call).await.expect("the command ends when stopped").unwrap();
+        assert!(!still_beating(&beat).await, "nothing the command started is left running");
+    }
+
+    #[tokio::test]
+    async fn git_works_in_a_jailed_worktree() {
+        if crate::tools::jail::probe().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main"])
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .is_ok_and(|out| out.status.success())
+        };
+        std::fs::create_dir_all(base.join("main")).unwrap();
+        if !git(&base.join("main"), &["init", "-q"])
+            || !git(&base.join("main"), &["commit", "-q", "--allow-empty", "-m", "first commit"])
+            || !git(&base.join("main"), &["worktree", "add", "-q", "../tree"])
+        {
+            return; // git is not installed, or too old for worktrees
+        }
+        let policy = crate::tools::JailPolicy { home: Some(base.join("home")), ..Default::default() };
+        let sandbox = Sandbox::new(base.join("tree"), Duration::from_secs(20)).unwrap().jailed(policy, false).unwrap();
+        let out = ExecuteCommand { sandbox }.run(&args("git", &["log", "--oneline"])).await;
+        assert!(out.starts_with("Command succeeded.") && out.contains("first commit"), "{out}");
+    }
+
+    #[test]
+    fn a_project_that_contains_the_home_directory_cannot_be_jailed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let policy = crate::tools::JailPolicy { home: Some(root.join("me")), ..Default::default() };
+        let error = Sandbox::new(&root, Duration::from_secs(1)).unwrap().jailed(policy, false).unwrap_err();
+        assert!(error.contains("home directory"), "{error}");
     }
 }
