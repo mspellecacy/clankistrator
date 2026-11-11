@@ -967,9 +967,15 @@ impl Orchestrator {
                         record_usage(&mut ctx, &advisor, run.usage, run.calls);
                         match run.outcome {
                             Ok(advice) => apply_advice(&mut ctx, &task_id, &next, advice),
-                            Err(e) => tracing::warn!(
-                                "Orchestrator [{task_id}]: no advice could be had ({e}); the next attempt goes ahead without it"
-                            ),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Orchestrator [{task_id}]: no advice could be had ({e}); the next attempt goes ahead without it"
+                                );
+                                // Earlier advice was written about files the failed attempt has since changed.
+                                if let Some(t) = ctx.get_task_mut(&task_id) {
+                                    t.advice = None;
+                                }
+                            }
                         }
                     }
                     Err(e) => tracing::error!("Orchestrator: the advisor crashed: {e}"),
@@ -1766,13 +1772,14 @@ mod tests {
         assert_eq!(end, RunEnd::Finished);
         // Straight to the model the advisor chose, skipping the one in between; four attempts in all.
         assert_eq!(worker_models(&llm), ["cheap", "strong", "strong", "strong"]);
-        // The advisor is not asked without limit, nor about an attempt that will not be repeated.
+        // The advisor is asked before every retry, but not about an attempt that will not be repeated.
         let consults = llm.requests(Kind::Advice);
-        assert_eq!(consults.len(), MAX_CONSULTS as usize);
+        assert_eq!(consults.len(), MAX_RETRIES as usize);
+        assert_eq!(MAX_CONSULTS, MAX_RETRIES);
         // Asked a second time, it is shown what it said the first time.
         assert!(consults[1].prompt.contains("# Advice you gave after an earlier failed attempt"));
         assert!(consults[1].prompt.contains("rewrite the parser"));
-        // Its latest advice stays in front of the worker after the consultations are used up.
+        // Each attempt has the latest advice in front of it, and only that.
         let workers = llm.requests(Kind::Worker);
         assert!(workers[1].prompt.contains("rewrite the parser"));
         assert!(workers[3].prompt.contains("try again") && !workers[3].prompt.contains("rewrite the parser"));
@@ -1797,6 +1804,26 @@ mod tests {
         assert_eq!(ctx.count_completed(), 2);
         let retry = &llm.requests(Kind::Worker)[1];
         assert!(retry.prompt.contains("error[E0425]") && !retry.prompt.contains("lead engineer"));
+    }
+
+    /// Advice describes the files as they were before the attempt that has now
+    /// failed, so it is not handed on when the advisor cannot be asked again.
+    #[tokio::test]
+    async fn advice_from_before_the_latest_failure_is_not_passed_on_when_no_new_advice_comes() {
+        let llm = ScriptedLlm::new(|kind, request, earlier| match kind {
+            Kind::Review if earlier < 2 => Ok(unmet_if(&request.prompt, "builds", "error[E0425]")),
+            Kind::Advice if earlier == 0 => Ok(r#"{"guidance": "add `use std::fmt;` to src/lib.rs"}"#.to_string()),
+            Kind::Advice => Err(LlmError::Other(anyhow!("HTTP 401 Unauthorized"))),
+            _ => agreeable(kind, request, earlier),
+        });
+        let (_dir, orchestrator, context) = setup(llm.clone(), true, 50);
+        context.lock().await.advisor_model = Some("lead".into());
+
+        assert_eq!(orchestrator.run(&context, Hitl::Stdin).await.unwrap(), RunEnd::Finished);
+        let workers = llm.requests(Kind::Worker);
+        assert!(workers[1].prompt.contains("add `use std::fmt;`"));
+        assert!(!workers[2].prompt.contains("lead engineer"), "{}", workers[2].prompt);
+        assert!(workers[2].prompt.contains("error[E0425]"), "the reviewer's findings are still passed on");
     }
 
     const INDEPENDENT_PLAN: &str = r#"[

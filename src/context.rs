@@ -206,9 +206,10 @@ pub struct ModelUsage {
 /// worker model, if there is one.
 pub const STEP_UP_AFTER: u32 = 2;
 
-/// How often the advisor is consulted about one task. Each consultation is a
-/// run of the most expensive model there is.
-pub const MAX_CONSULTS: u32 = 2;
+/// How often the advisor is consulted about one task: once before every
+/// retry. A consultation costs about as much as a review, and a retry made
+/// without one is working from advice about code that has since changed.
+pub const MAX_CONSULTS: u32 = MAX_RETRIES;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub enum RunPhase {
