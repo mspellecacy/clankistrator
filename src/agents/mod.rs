@@ -760,13 +760,16 @@ pub async fn advise(
              The worker had this in front of it for the attempt that has now failed.\n\n{earlier}\n"
         ));
     }
+    // A task taken up again after an earlier run gave up on it has made no attempt in this one.
+    let which = if task.retries == 0 {
+        format!("an earlier run used up its attempts; this run allows {} more; last attempt made by {}", MAX_RETRIES + 1, attempt.model)
+    } else {
+        format!("failed attempt {} of at most {}, made by {}", task.retries, MAX_RETRIES + 1, attempt.model)
+    };
     prompt.push_str(&format!(
-        "\n# What went wrong (failed attempt {} of at most {}, made by {})\n\n{}\n\
+        "\n# What went wrong ({which})\n\n{}\n\
          \n# Worker models\n\nListed from cheapest to most capable.\n\n{}\n\
          The next attempt is set to run on {}.\n\n{}",
-        task.retries,
-        MAX_RETRIES + 1,
-        attempt.model,
         task.feedback.as_deref().unwrap_or("(no details were recorded)"),
         attempt.pool_facts,
         attempt.next_model,

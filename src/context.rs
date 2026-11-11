@@ -206,10 +206,9 @@ pub struct ModelUsage {
 /// worker model, if there is one.
 pub const STEP_UP_AFTER: u32 = 2;
 
-/// How often the advisor is consulted about one task: once before every
-/// retry. A consultation costs about as much as a review, and a retry made
-/// without one is working from advice about code that has since changed.
-pub const MAX_CONSULTS: u32 = MAX_RETRIES;
+/// How a task's failure is worded when every worker model has dropped out.
+/// Such a failure says nothing about the work, so it needs no advice.
+pub const NO_WORKER_MODEL: &str = "No worker model can be used any more.";
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub enum RunPhase {
@@ -632,6 +631,7 @@ impl ProjectContext {
                     t.status = TaskStatus::ReadyForReview { output_summary: output_summary.clone() };
                 }
                 TaskStatus::Failed { error } => {
+                    let work_failed = !error.starts_with("Blocked:") && !error.starts_with(NO_WORKER_MODEL);
                     if !error.starts_with("Blocked:") {
                         t.feedback = Some(format!("An earlier run gave up on this task: {error}"));
                     }
@@ -641,7 +641,12 @@ impl ProjectContext {
                     t.retries = 0;
                     t.failures_on_model = 0;
                     t.consults = 0;
-                    t.advice_wanted_after = None;
+                    // The advisor looks at what the earlier run left behind before
+                    // the first new attempt. What it said then is about files that
+                    // later attempts changed; it is shown to the advisor, and
+                    // dropped if no advisor is there to replace it.
+                    t.advice_wanted_after = work_failed
+                        .then(|| t.attempt_model.clone().unwrap_or_else(|| "an earlier run's model".to_string()));
                 }
                 _ => {}
             }
@@ -841,7 +846,8 @@ pub(crate) mod tests {
         ctx.get_task_mut("C").unwrap().status = TaskStatus::Failed { error: "nope".into() };
         ctx.get_task_mut("C").unwrap().retries = 4;
         ctx.get_task_mut("C").unwrap().failures_on_model = 2;
-        ctx.get_task_mut("C").unwrap().consults = MAX_CONSULTS;
+        ctx.get_task_mut("C").unwrap().consults = 2;
+        ctx.get_task_mut("C").unwrap().attempt_model = Some("cheap".into());
         ctx.fail_blocked();
         ctx.steps_taken = 7;
         ctx.input_tokens = 123;
@@ -857,6 +863,7 @@ pub(crate) mod tests {
         let c = loaded.get_task("C").unwrap();
         assert_eq!(c.status, TaskStatus::Pending);
         assert_eq!((c.retries, c.failures_on_model, c.consults), (0, 0, 0));
+        assert_eq!(c.advice_wanted_after.as_deref(), Some("cheap"), "the advisor looks before the first new attempt");
         assert!(c.feedback.as_deref().unwrap().contains("nope"));
         let d = loaded.get_task("D").unwrap();
         assert_eq!(d.status, TaskStatus::Pending);

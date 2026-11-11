@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 
 use crate::agents::{self, AgentSettings, ReviewVerdict, WorkerOutcome};
 use crate::context::{
-    AgentRole, Finding, MAX_CONSULTS, MAX_RETRIES, Requirement, ProjectContext, ProjectTask, RunPhase, STATE_DIR, TaskDef,
+    AgentRole, Finding, MAX_RETRIES, NO_WORKER_MODEL, Requirement, ProjectContext, ProjectTask, RunPhase, STATE_DIR, TaskDef,
     TaskStatus, validate_task_graph, STEP_UP_AFTER,
 };
 use crate::llm::{AgentRequest, Llm, TokenUsage};
@@ -346,7 +346,7 @@ fn note_failed_attempt(ctx: &mut ProjectContext, task_id: &str, model: &str) {
     let has_advisor = ctx.advisor_model.is_some();
     let Some(failures) = ctx.get_task_mut(task_id).map(|t| {
         t.failures_on_model += 1;
-        if has_advisor && t.consults < MAX_CONSULTS {
+        if has_advisor {
             t.advice_wanted_after = Some(model.to_string());
         }
         t.failures_on_model
@@ -731,6 +731,76 @@ impl Orchestrator {
     /// requirements become one fix task, as long as fix rounds remain; the
     /// findings stay in the context either way, so the run cannot end looking
     /// successful while requirements are known to be unmet.
+    /// Have the advisor look at every task whose latest attempt failed and
+    /// which is about to be tried again.
+    async fn consult(&self, context: &SharedContext, settings: &AgentSettings) {
+    let (advisor, to_advise, pool_facts) = {
+        let mut ctx = context.lock().await;
+        let advisor = ctx.advisor_model.clone();
+        let mut to_advise: Vec<(ProjectTask, String, String)> = Vec::new();
+        for index in 0..ctx.tasks.len() {
+            let Some(failed_on) = ctx.tasks[index].advice_wanted_after.take() else { continue };
+            if advisor.is_none() {
+                // What was said before the failure describes files that have since changed.
+                ctx.tasks[index].advice = None;
+                continue;
+            }
+            if ctx.tasks[index].status != TaskStatus::Pending {
+                continue;
+            }
+            // With no worker model left there will be no next attempt to advise.
+            let Some(next) = ctx.worker_model_for(&ctx.tasks[index]) else { continue };
+            ctx.tasks[index].consults += 1;
+            to_advise.push((ctx.tasks[index].clone(), failed_on, next));
+        }
+        (advisor, to_advise, describe_pool(&ctx))
+    };
+    if let Some(advisor) = advisor {
+        let mut advising = JoinSet::new();
+        for (task, failed_on, next) in to_advise {
+            let llm = Arc::clone(&self.llm);
+            let semaphore = Arc::clone(&self.semaphore);
+            let settings = settings.clone();
+            let advisor = advisor.clone();
+            let pool_facts = pool_facts.clone();
+            advising.spawn(async move {
+                let _permit = semaphore.acquire().await.expect("semaphore is never closed");
+                let attempt = agents::FailedAttempt {
+                    task: &task,
+                    model: &failed_on,
+                    next_model: &next,
+                    pool_facts: &pool_facts,
+                };
+                let run = agents::advise(llm.as_ref(), &advisor, &attempt, &settings).await;
+                (task.id, next, run)
+            });
+        }
+        while let Some(joined) = advising.join_next().await {
+            let mut ctx = context.lock().await;
+            match joined {
+                Ok((task_id, next, run)) => {
+                    save_transcript(self.sandbox.root(), &format!("{task_id}.advice"), run.reply.as_deref());
+                    record_usage(&mut ctx, &advisor, run.usage, run.calls);
+                    match run.outcome {
+                        Ok(advice) => apply_advice(&mut ctx, &task_id, &next, advice),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Orchestrator [{task_id}]: no advice could be had ({e}); the next attempt goes ahead without it"
+                            );
+                            // Earlier advice was written about files the failed attempt has since changed.
+                            if let Some(t) = ctx.get_task_mut(&task_id) {
+                                t.advice = None;
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::error!("Orchestrator: the advisor crashed: {e}"),
+            }
+            save(&ctx);
+        }
+    }
+    }
+
     async fn design_check(&self, context: &SharedContext) {
         let (settings, known_requirements) = {
             let mut ctx = context.lock().await;
@@ -803,6 +873,16 @@ impl Orchestrator {
     pub async fn run_iteration(&self, context: &SharedContext) -> Result<IterationReport> {
         let mut report = IterationReport::default();
 
+        // A task that an earlier run gave up on is waiting for the advisor's
+        // look before its first attempt in this one.
+        let resumed = {
+            let ctx = context.lock().await;
+            ctx.tasks.iter().any(|t| t.advice_wanted_after.is_some()).then(|| self.settings(&ctx))
+        };
+        if let Some(settings) = resumed {
+            self.consult(context, &settings).await;
+        }
+
         // Settings are read from the context every pass, so changes made in the
         // TUI (model, brave mode) take effect on the next one.
         let (settings, ready, prior_work) = {
@@ -825,7 +905,7 @@ impl Orchestrator {
                     tracing::error!("Orchestrator [{}]: no worker model can be used any more", task.id);
                     if let Some(t) = ctx.get_task_mut(&task.id) {
                         t.status = TaskStatus::Failed {
-                            error: format!("No worker model can be used any more. {}", reasons.join("; ")),
+                            error: format!("{NO_WORKER_MODEL} {}", reasons.join("; ")),
                         };
                     }
                     report.given_up += 1;
@@ -923,66 +1003,7 @@ impl Orchestrator {
         // 3. Advice. A task whose attempt failed is looked at by the advisor
         // before it is tried again. The step-up rule has already been applied,
         // so if the advisor cannot be reached the task still moves on sensibly.
-        let (advisor, to_advise, pool_facts) = {
-            let mut ctx = context.lock().await;
-            let advisor = ctx.advisor_model.clone();
-            let mut to_advise: Vec<(ProjectTask, String, String)> = Vec::new();
-            for index in 0..ctx.tasks.len() {
-                let Some(failed_on) = ctx.tasks[index].advice_wanted_after.take() else { continue };
-                if advisor.is_none() || ctx.tasks[index].status != TaskStatus::Pending {
-                    continue;
-                }
-                // With no worker model left there will be no next attempt to advise.
-                let Some(next) = ctx.worker_model_for(&ctx.tasks[index]) else { continue };
-                ctx.tasks[index].consults += 1;
-                to_advise.push((ctx.tasks[index].clone(), failed_on, next));
-            }
-            (advisor, to_advise, describe_pool(&ctx))
-        };
-        if let Some(advisor) = advisor {
-            let mut advising = JoinSet::new();
-            for (task, failed_on, next) in to_advise {
-                let llm = Arc::clone(&self.llm);
-                let semaphore = Arc::clone(&self.semaphore);
-                let settings = settings.clone();
-                let advisor = advisor.clone();
-                let pool_facts = pool_facts.clone();
-                advising.spawn(async move {
-                    let _permit = semaphore.acquire().await.expect("semaphore is never closed");
-                    let attempt = agents::FailedAttempt {
-                        task: &task,
-                        model: &failed_on,
-                        next_model: &next,
-                        pool_facts: &pool_facts,
-                    };
-                    let run = agents::advise(llm.as_ref(), &advisor, &attempt, &settings).await;
-                    (task.id, next, run)
-                });
-            }
-            while let Some(joined) = advising.join_next().await {
-                let mut ctx = context.lock().await;
-                match joined {
-                    Ok((task_id, next, run)) => {
-                        save_transcript(self.sandbox.root(), &format!("{task_id}.advice"), run.reply.as_deref());
-                        record_usage(&mut ctx, &advisor, run.usage, run.calls);
-                        match run.outcome {
-                            Ok(advice) => apply_advice(&mut ctx, &task_id, &next, advice),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Orchestrator [{task_id}]: no advice could be had ({e}); the next attempt goes ahead without it"
-                                );
-                                // Earlier advice was written about files the failed attempt has since changed.
-                                if let Some(t) = ctx.get_task_mut(&task_id) {
-                                    t.advice = None;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => tracing::error!("Orchestrator: the advisor crashed: {e}"),
-                }
-                save(&ctx);
-            }
-        }
+        self.consult(context, &settings).await;
 
         {
             let mut ctx = context.lock().await;
@@ -1775,7 +1796,6 @@ mod tests {
         // The advisor is asked before every retry, but not about an attempt that will not be repeated.
         let consults = llm.requests(Kind::Advice);
         assert_eq!(consults.len(), MAX_RETRIES as usize);
-        assert_eq!(MAX_CONSULTS, MAX_RETRIES);
         // Asked a second time, it is shown what it said the first time.
         assert!(consults[1].prompt.contains("# Advice you gave after an earlier failed attempt"));
         assert!(consults[1].prompt.contains("rewrite the parser"));
@@ -1785,7 +1805,7 @@ mod tests {
         assert!(workers[3].prompt.contains("try again") && !workers[3].prompt.contains("rewrite the parser"));
         let ctx = context.lock().await;
         assert!(matches!(status_of(&ctx, "TASK-1"), TaskStatus::Failed { .. }));
-        assert_eq!(ctx.get_task("TASK-1").unwrap().consults, MAX_CONSULTS);
+        assert_eq!(ctx.get_task("TASK-1").unwrap().consults, MAX_RETRIES);
     }
 
     #[tokio::test]
@@ -1824,6 +1844,67 @@ mod tests {
         assert!(workers[1].prompt.contains("add `use std::fmt;`"));
         assert!(!workers[2].prompt.contains("lead engineer"), "{}", workers[2].prompt);
         assert!(workers[2].prompt.contains("error[E0425]"), "the reviewer's findings are still passed on");
+    }
+
+    /// A first run in which every attempt at TASK-1 is rejected, then the saved
+    /// state loaded for a second run with a model that does everything right.
+    async fn resumed_after_giving_up(keep_advisor: bool) -> (tempfile::TempDir, Arc<ScriptedLlm>, SharedContext) {
+        let llm = ScriptedLlm::new(|kind, request, earlier| {
+            Ok(match kind {
+                Kind::Review => unmet_if(&request.prompt, "builds", "error[E0425]"),
+                Kind::Advice => r#"{"guidance": "OLD ADVICE: leave main unchanged"}"#.to_string(),
+                _ => agreeable(kind, request, earlier)?,
+            })
+        });
+        let (dir, orchestrator, context) = setup(llm, true, 0);
+        context.lock().await.advisor_model = Some("lead".into());
+        tokio::time::timeout(Duration::from_secs(20), orchestrator.run(&context, Hitl::Stdin))
+            .await
+            .expect("the run must terminate")
+            .unwrap();
+        let output_dir = context.lock().await.working_directory.clone();
+
+        let mut loaded = ProjectContext::load(Path::new(&output_dir)).unwrap();
+        assert!(matches!(status_of(&loaded, "TASK-1"), TaskStatus::Failed { .. }));
+        assert!(loaded.get_task("TASK-1").unwrap().advice.as_deref().unwrap().contains("OLD ADVICE"));
+        loaded.prepare_resume();
+        if !keep_advisor {
+            loaded.advisor_model = None;
+        }
+        let context = Arc::new(Mutex::new(loaded));
+        let llm = ScriptedLlm::new(agreeable);
+        let sandbox = Sandbox::new(&output_dir, Duration::from_secs(5)).unwrap();
+        let mut orchestrator = Orchestrator::new(llm.clone(), "THE DESIGN DOCUMENT".into(), sandbox);
+        orchestrator.retry_delay = Duration::ZERO;
+        assert_eq!(orchestrator.run(&context, Hitl::Stdin).await.unwrap(), RunEnd::Finished);
+        (dir, llm, context)
+    }
+
+    /// The advice an earlier run ended with was written before its last
+    /// attempts changed the files, so a resumed task is looked at afresh first.
+    #[tokio::test]
+    async fn a_task_an_earlier_run_gave_up_on_is_looked_at_before_it_is_tried_again() {
+        let (_dir, llm, context) = resumed_after_giving_up(true).await;
+
+        let consults = llm.requests(Kind::Advice);
+        assert_eq!(consults.len(), 1);
+        assert!(consults[0].prompt.contains("an earlier run used up its attempts"), "{}", consults[0].prompt);
+        assert!(consults[0].prompt.contains("OLD ADVICE"), "the advisor sees what it said before");
+        let first = &llm.requests(Kind::Worker)[0];
+        assert!(first.prompt.contains("# Advice from the lead engineer"), "{}", first.prompt);
+        assert!(!first.prompt.contains("OLD ADVICE"), "{}", first.prompt);
+        assert!(context.lock().await.succeeded());
+    }
+
+    #[tokio::test]
+    async fn resumed_without_an_advisor_the_old_advice_is_not_passed_on() {
+        let (_dir, llm, context) = resumed_after_giving_up(false).await;
+
+        assert!(llm.requests(Kind::Advice).is_empty());
+        let first = &llm.requests(Kind::Worker)[0];
+        assert!(!first.prompt.contains("lead engineer"), "{}", first.prompt);
+        assert!(first.prompt.contains("An earlier run gave up on this task"));
+        assert!(context.lock().await.succeeded());
     }
 
     const INDEPENDENT_PLAN: &str = r#"[
