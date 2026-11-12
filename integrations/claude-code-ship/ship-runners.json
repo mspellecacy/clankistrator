@@ -1,0 +1,9 @@
+{
+  "tool": "mcp__clankistrator__run_agent",
+  "start": { "small": "claude-haiku-5-5", "standard": "gpt-6.1-sol" },
+  "ladder": ["claude-haiku-5-5", "gpt-6.1-sol"],
+  "reviewer_for": { "claude-haiku-5-5": "gpt-6-sol", "gpt-6.1-sol": "claude-sonnet-5-5" },
+  "implementer_args": { "write_access": true },
+  "reviewer_args": { "scratch": true },
+  "run_cap_minutes": 30
+}

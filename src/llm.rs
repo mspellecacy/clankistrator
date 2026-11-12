@@ -1,7 +1,7 @@
 //! The single place where Clankistrator talks to a model provider.
 //!
-//! Everything else goes through the [`Llm`] trait, which keeps the orchestration
-//! logic testable with scripted replies.
+//! Everything else goes through the [`Llm`] trait, which keeps the rest
+//! testable with scripted replies.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -20,7 +20,7 @@ use tokio::time::Instant;
 use crate::tools::{Sandbox, ToolAccess};
 
 /// Upper bound on one agent run (all of its turns), so a stalled connection
-/// cannot hang the orchestrator forever. `--run-timeout` replaces it.
+/// cannot hang the server's caller forever. `--run-timeout` replaces it.
 pub const DEFAULT_AGENT_RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 static AGENT_RUN_TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
@@ -80,23 +80,9 @@ impl Pacer {
     }
 }
 
-/// Requests sent to OpenRouter's free models by this process, including
-/// failed ones: the free tier's daily allowance counts requests, not tokens.
-pub fn free_model_requests() -> u64 {
-    FREE_MODEL_PACER.sent.load(Ordering::Relaxed)
-}
-
 /// OpenRouter marks the variants it does not charge for with this suffix.
 pub fn is_free_openrouter_model(model: &str) -> bool {
     model.trim().ends_with(":free")
-}
-
-/// Is any of these model specs an OpenRouter free model?
-pub fn uses_free_tier(model_specs: &[&str]) -> bool {
-    model_specs.iter().any(|spec| {
-        let (provider, model) = resolve_model(spec);
-        provider == Provider::OpenRouter && is_free_openrouter_model(model)
-    })
 }
 
 /// The HTTP status in an error from a provider, if it carries one.
@@ -106,19 +92,6 @@ pub fn http_status(error: &str) -> Option<u16> {
         .split_once("status code ")
         .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
         .and_then(|digits| digits.parse::<u16>().ok())
-}
-
-/// Does this error mean the model cannot be used at all for now, whatever is
-/// asked of it? A worker model is dropped from a run on the strength of this,
-/// so it goes by the status the provider sent or by this program's own
-/// messages, never by a word that happens to occur in an error text.
-pub fn model_unusable(error: &str) -> bool {
-    if let Some(status) = http_status(error) {
-        return matches!(status, 401..=404);
-    }
-    [FREE_ALLOWANCE_USED_UP, "is not a free OpenRouter model", "is not set", "could not create the"]
-        .iter()
-        .any(|own| error.contains(own))
 }
 
 /// Would sending the same request again later plausibly work?
@@ -156,7 +129,7 @@ pub struct FreeAllowance {
 
 /// The error text for a used-up daily allowance. Not transient, and permanent for an agent.
 pub const FREE_ALLOWANCE_USED_UP: &str = "OpenRouter's free-model allowance for today is used up. It is counted \
-     per UTC day; continue with --resume after it resets, or use a model that is not on the free tier.";
+     per UTC day; try again after it resets, or use a model that is not on the free tier.";
 
 fn parse_free_allowance(body: &serde_json::Value) -> Option<FreeAllowance> {
     let counter = body.get("data")?.get("free_model_daily_requests")?;
@@ -559,7 +532,7 @@ macro_rules! run_agent {
 impl RigLlm {
     async fn dispatch(&self, request: &AgentRequest) -> Result<LlmReply, LlmError> {
         let (provider, model) = resolve_model(&request.model);
-        // Checked here as well as at startup: the TUI and the MCP server can name a model later.
+        // Checked here as well as at startup: the MCP server can name a model later.
         check_credentials(&request.model).map_err(LlmError::Other)?;
         let key = api_key(provider).map_err(LlmError::Other)?;
         let client_error = |e| LlmError::Other(anyhow!("could not create the {provider:?} client: {e}"));
@@ -856,29 +829,9 @@ mod tests {
     }
 
     #[test]
-    fn a_model_is_only_given_up_on_for_a_reason_that_is_certain() {
-        assert!(model_unusable("HttpError: Invalid status code 401 Unauthorized"));
-        assert!(model_unusable("HttpError: Invalid status code 402 Payment Required"));
-        assert!(model_unusable("HttpError: Invalid status code 404 Not Found with message: no such model"));
-        assert!(model_unusable(&CompletionError::ProviderError(FREE_ALLOWANCE_USED_UP.to_string()).to_string()));
-        assert!(model_unusable("OPENROUTER_API_KEY is not set (or still holds the placeholder from .env.example)."));
-        // A rate limit whose text happens to contain the digits of an auth error.
-        assert!(!model_unusable(
-            "HttpError: Invalid status code 429 Too Many Requests with message: Requested 40312 tokens, limit 40100"
-        ));
-        assert!(!model_unusable("ProviderError: you do not have permission to exceed 4030 requests per minute"));
-        assert!(!model_unusable("HttpError: Invalid status code 503 Service Unavailable"));
-        assert!(!model_unusable("HttpError: error sending request for url"));
-    }
-
-    #[test]
     fn free_openrouter_models_are_recognised_by_their_suffix() {
         assert!(is_free_openrouter_model("cohere/north-mini-code:free"));
         assert!(!is_free_openrouter_model("cohere/north-mini-code"));
-        assert!(uses_free_tier(&["gpt-4o", "openrouter:cohere/north-mini-code:free"]));
-        assert!(!uses_free_tier(&["gpt-4o", "openrouter:cohere/north-mini-code"]));
-        // The suffix means nothing on another provider.
-        assert!(!uses_free_tier(&["ollama:some-model:free"]));
     }
 
     #[test]

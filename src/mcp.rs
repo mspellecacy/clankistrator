@@ -1,8 +1,6 @@
-//! A small MCP server (JSON-RPC over stdio) exposing Clankistrator's planning side.
-//!
-//! As it comes, it has no tool that runs commands or writes files. Started
-//! with `--delegate` it also offers `run_agent`, which does both: it runs an
-//! agent in a project directory for the MCP client (see [`crate::delegate`]).
+//! A small MCP server (JSON-RPC over stdio) with one tool, `run_agent`: it
+//! runs an agent in a project directory for the MCP client (see
+//! [`crate::delegate`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,12 +12,8 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufRea
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinSet};
 
-use crate::context::ProjectContext;
 use crate::delegate::{self, Delegation};
-use crate::llm::{Llm, check_credentials};
-use crate::orchestrator::{WorkerChoice, plan_tasks};
-use crate::parser::markdown::MarkdownParser;
-use crate::tools::Sandbox;
+use crate::llm::Llm;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const RUN_AGENT: &str = "run_agent";
@@ -125,8 +119,7 @@ pub struct McpServer {
     name: String,
     version: String,
     llm: Arc<dyn Llm>,
-    default_model: String,
-    delegating: Option<Delegating>,
+    delegating: Delegating,
 }
 
 /// What a message turned out to ask for.
@@ -190,20 +183,8 @@ fn text_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
 }
 
 impl McpServer {
-    pub fn new(llm: Arc<dyn Llm>, default_model: String) -> Self {
-        Self {
-            name: "clankistrator".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            llm,
-            default_model,
-            delegating: None,
-        }
-    }
-
-    /// Also offer `run_agent`.
-    pub fn delegating(mut self, delegating: Delegating) -> Self {
-        self.delegating = Some(delegating);
-        self
+    pub fn new(llm: Arc<dyn Llm>, delegating: Delegating) -> Self {
+        Self { name: "clankistrator".to_string(), version: env!("CARGO_PKG_VERSION").to_string(), llm, delegating }
     }
 
     /// Serve requests from stdin until it closes. Responses go to stdout, one JSON object per line.
@@ -371,24 +352,22 @@ impl McpServer {
                     Err(refusal) => Ok(tool_result(Err(refusal))),
                 }
             }
-            "tools/call" => self.call_tool(&params).await,
+            "tools/call" => match params.get("name").and_then(Value::as_str) {
+                Some(name) => Err((-32602, format!("Unknown tool: {name}"))),
+                None => Err((-32602, "tools/call requires a 'name'".to_string())),
+            },
             _ => Err((-32601, format!("Method not found: {method}"))),
         };
         Begun::Reply(Some(respond(&id, outcome)))
     }
 
     fn usage_log(&self) -> Option<&Path> {
-        self.delegating.as_ref().and_then(|delegating| delegating.usage_log.as_deref())
+        self.delegating.usage_log.as_deref()
     }
 
     /// Check a `run_agent` call against what the server was started to allow.
     fn prepare_agent(&self, args: &Value) -> Result<delegate::Prepared, String> {
-        let Some(delegating) = &self.delegating else {
-            return Err(format!(
-                "{RUN_AGENT} is switched off. It runs commands and changes files, so the server only offers \
-                 it when it is started with --delegate."
-            ));
-        };
+        let delegating = &self.delegating;
         let text = |name: &str| args.get(name).and_then(Value::as_str).filter(|s| !s.trim().is_empty());
         let model = match text("model") {
             Some(model) if delegating.models.iter().any(|allowed| allowed == model.trim()) => model.trim(),
@@ -504,161 +483,7 @@ impl McpServer {
     }
 
     fn tool_list(&self) -> Value {
-        let mut tools = Self::planning_tools();
-        if let (Some(delegating), Some(list)) = (&self.delegating, tools.as_array_mut()) {
-            list.push(Self::run_agent_tool(delegating));
-        }
-        tools
-    }
-
-    fn planning_tools() -> Value {
-        json!([
-            {
-                "name": "parse_markdown_design",
-                "description": "Split a Markdown design document into its sections (heading and text). Returns a JSON list.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string", "description": "Path to the Markdown file." }
-                    },
-                    "required": ["path"]
-                }
-            },
-            {
-                "name": "plan_tasks",
-                "description": "Ask the configured model to decompose a Markdown design document into a validated task graph (ids, roles, dependencies). Calls the model provider, so it costs tokens. Nothing is executed or written.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string", "description": "Path to the Markdown design document." },
-                        "model": { "type": "string", "description": "Model to use instead of the server default." },
-                        "workers": { "type": "array", "items": { "type": "string" }, "description": "Worker models, cheapest first. With two or more, the plan assigns each task to one of them." }
-                    },
-                    "required": ["path"]
-                }
-            },
-            {
-                "name": "project_status",
-                "description": "Report the saved state of a Clankistrator run: phase, tasks with their statuses, and token usage.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "output_dir": { "type": "string", "description": "The --output directory of the run." }
-                    },
-                    "required": ["output_dir"]
-                }
-            }
-        ])
-    }
-
-    async fn call_tool(&self, params: &Value) -> Result<Value, (i64, String)> {
-        let name = params
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or((-32602, "tools/call requires a 'name'".to_string()))?;
-        let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-
-        let result = match name {
-            "parse_markdown_design" => Self::parse_design(&args),
-            "plan_tasks" => self.plan(&args).await,
-            "project_status" => Self::status(&args),
-            _ => return Err((-32602, format!("Unknown tool: {name}"))),
-        };
-        Ok(tool_result(result))
-    }
-
-    fn read_design(args: &Value) -> Result<String, String> {
-        let path = text_arg(args, "path")?;
-        std::fs::read_to_string(path).map_err(|e| format!("Failed to read {path}: {e}"))
-    }
-
-    fn parse_design(args: &Value) -> Result<String, String> {
-        let sections: Vec<Value> = MarkdownParser::parse_sections(&Self::read_design(args)?)
-            .into_iter()
-            .map(|s| json!({ "title": s.title, "content": s.content }))
-            .collect();
-        serde_json::to_string_pretty(&sections).map_err(|e| e.to_string())
-    }
-
-    async fn plan(&self, args: &Value) -> Result<String, String> {
-        let design = Self::read_design(args)?;
-        let model = args.get("model").and_then(Value::as_str).unwrap_or(&self.default_model);
-        check_credentials(model).map_err(|e| e.to_string())?;
-        // Planning uses no tools; the sandbox is only a formality here.
-        let sandbox = Sandbox::new(std::env::temp_dir(), Duration::from_secs(1)).map_err(|e| e.to_string())?;
-        let pool: Vec<String> = args
-            .get("workers")
-            .and_then(Value::as_array)
-            .map(|models| models.iter().filter_map(Value::as_str).map(str::to_string).collect())
-            .unwrap_or_default();
-        let workers = if pool.len() < 2 {
-            WorkerChoice::default()
-        } else {
-            let mut ctx =
-                ProjectContext::new(String::new(), std::env::temp_dir(), 0, 1, false, model.to_string());
-            ctx.worker_models = pool;
-            WorkerChoice::of(&ctx)
-        };
-        let (tasks, usage, _) = plan_tasks(self.llm.as_ref(), model, &design, &sandbox, &workers)
-            .await
-            .map_err(|e| format!("{e:#}"))?;
-        let tasks: Vec<Value> = tasks
-            .iter()
-            .map(|t| {
-                json!({
-                    "id": t.id,
-                    "title": t.title,
-                    "description": t.description,
-                    "assigned_role": t.assigned_role,
-                    "dependencies": t.dependencies,
-                    "acceptance_criteria": t.acceptance_criteria,
-                    "model": t.model,
-                    "model_reason": t.model_reason,
-                })
-            })
-            .collect();
-        serde_json::to_string_pretty(&json!({
-            "model": model,
-            "tasks": tasks,
-            "usage": {
-                "input_tokens": usage.input_tokens,
-                "cached_input_tokens": usage.cached_input_tokens,
-                "output_tokens": usage.output_tokens
-            }
-        }))
-        .map_err(|e| e.to_string())
-    }
-
-    fn status(args: &Value) -> Result<String, String> {
-        let dir = text_arg(args, "output_dir")?;
-        let ctx = ProjectContext::load(Path::new(dir)).map_err(|e| format!("{e:#}"))?;
-        let tasks: Vec<Value> = ctx
-            .tasks
-            .iter()
-            .map(|t| {
-                json!({
-                    "id": t.id,
-                    "title": t.title,
-                    "status": t.status,
-                    "retries": t.retries,
-                    "files": t.files,
-                })
-            })
-            .collect();
-        serde_json::to_string_pretty(&json!({
-            "project": ctx.project_name,
-            "phase": ctx.phase.label(),
-            "model": ctx.model,
-            "steps_taken": ctx.steps_taken,
-            "tasks": tasks,
-            "usage": {
-                "model_calls": ctx.llm_calls,
-                "input_tokens": ctx.input_tokens,
-                "cached_input_tokens": ctx.cached_input_tokens,
-                "output_tokens": ctx.output_tokens
-            }
-        }))
-        .map_err(|e| e.to_string())
+        json!([Self::run_agent_tool(&self.delegating)])
     }
 }
 
@@ -666,6 +491,7 @@ impl McpServer {
 mod tests {
     use super::*;
     use crate::delegate::tests::ActingLlm;
+    use crate::tools::Sandbox;
     use crate::llm::{AgentRequest, LlmFuture, LlmReply, TokenUsage};
 
     struct FixedLlm(&'static str);
@@ -676,7 +502,7 @@ mod tests {
     }
 
     fn server(reply: &'static str) -> McpServer {
-        McpServer::new(Arc::new(FixedLlm(reply)), "ollama:test".into())
+        delegating_server(Arc::new(FixedLlm(reply)))
     }
 
     async fn call(server: &McpServer, request: Value) -> Value {
@@ -700,7 +526,7 @@ mod tests {
         let list = call(&server, json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).await;
         let names: Vec<&str> =
             list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["parse_markdown_design", "plan_tasks", "project_status"]);
+        assert_eq!(names, ["run_agent"]);
     }
 
     #[tokio::test]
@@ -723,11 +549,8 @@ mod tests {
         let garbage = server.handle_line("{not json").await.unwrap();
         assert_eq!(garbage["error"]["code"], -32700);
 
-        let missing_arg = call(
-            &server,
-            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"parse_markdown_design"}}),
-        )
-        .await;
+        let missing_arg =
+            call(&server, json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run_agent"}})).await;
         assert_eq!(missing_arg["result"]["isError"], true);
     }
 
@@ -752,14 +575,17 @@ mod tests {
                 .collect()
         };
         let server_with = |llm: Arc<dyn Llm>, log: &Path| {
-            McpServer::new(llm, "ollama:test".into()).delegating(Delegating {
-                models: vec!["ollama:small".into()],
-                max_turns: 3,
-                command_timeout: Duration::from_secs(30),
-                jail: None,
-                hidden: Vec::new(),
-                usage_log: Some(log.to_path_buf()),
-            })
+            McpServer::new(
+                llm,
+                Delegating {
+                    models: vec!["ollama:small".into()],
+                    max_turns: 3,
+                    command_timeout: Duration::from_secs(30),
+                    jail: None,
+                    hidden: Vec::new(),
+                    usage_log: Some(log.to_path_buf()),
+                },
+            )
         };
         let arguments = json!({"directory": project.path(), "agent": "reviewer", "prompt": "SECRET-PROMPT"});
 
@@ -838,14 +664,17 @@ mod tests {
     }
 
     fn delegating_server(llm: Arc<dyn Llm>) -> McpServer {
-        McpServer::new(llm, "ollama:test".into()).delegating(Delegating {
-            models: vec!["ollama:small".into(), "ollama:large".into()],
-            max_turns: 12,
-            command_timeout: Duration::from_secs(30),
-            jail: None,
-            hidden: Vec::new(),
-            usage_log: None,
-        })
+        McpServer::new(
+            llm,
+            Delegating {
+                models: vec!["ollama:small".into(), "ollama:large".into()],
+                max_turns: 12,
+                command_timeout: Duration::from_secs(30),
+                jail: None,
+                hidden: Vec::new(),
+                usage_log: None,
+            },
+        )
     }
 
     fn run_agent(id: u64, arguments: Value) -> Value {
@@ -853,22 +682,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_agent_is_offered_only_by_a_delegating_server() {
-        let project = crate::delegate::tests::project();
-        let arguments = json!({"directory": project.path(), "prompt": "Review it."});
-
-        let plain = server("unused");
-        let refused = call(&plain, run_agent(1, arguments.clone())).await;
-        assert_eq!(refused["result"]["isError"], true);
-        assert!(tool_text(&refused).contains("--delegate"));
-
+    async fn run_agent_is_the_only_tool_and_names_the_servers_models() {
         let llm = Arc::new(ActingLlm::replying("unused"));
-        let delegating = delegating_server(llm.clone());
-        let list = call(&delegating, json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).await;
+        let server = delegating_server(llm.clone());
+        let list = call(&server, json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).await;
         let tools = list["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
-        assert_eq!(tools[3]["name"], "run_agent");
-        assert!(tools[3]["description"].as_str().unwrap().contains("ollama:small, ollama:large"));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "run_agent");
+        assert!(tools[0]["description"].as_str().unwrap().contains("ollama:small, ollama:large"));
         assert!(llm.requests.lock().unwrap().is_empty());
     }
 
@@ -1093,51 +914,5 @@ mod tests {
         assert_eq!(refused["id"], 6);
         assert_eq!(refused["result"]["isError"], true);
         connection.served.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn tools_do_real_work() {
-        let dir = tempfile::tempdir().unwrap();
-        let design = dir.path().join("design.md");
-        std::fs::write(&design, "# Vision\nA calculator.\n\n## Features\n- Add\n").unwrap();
-        let server = server(
-            r#"[{"id":"TASK-1","title":"Build","description":"Build it","dependencies":[],"assigned_role":"Backend"}]"#,
-        );
-
-        let parsed = call(
-            &server,
-            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"parse_markdown_design","arguments":{"path":design}}}),
-        )
-        .await;
-        let sections: Value = serde_json::from_str(tool_text(&parsed)).unwrap();
-        assert_eq!(sections[0]["title"], "Vision");
-        assert_eq!(sections[1]["title"], "Features");
-
-        let planned = call(
-            &server,
-            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"plan_tasks","arguments":{"path":design}}}),
-        )
-        .await;
-        let plan: Value = serde_json::from_str(tool_text(&planned)).unwrap();
-        assert_eq!(plan["tasks"][0]["id"], "TASK-1");
-        assert_eq!(plan["tasks"][0]["assigned_role"], "Backend");
-
-        let mut ctx = ProjectContext::new("p".into(), dir.path().to_path_buf(), 5, 5, false, "m".into());
-        ctx.tasks = vec![crate::context::tests::task("TASK-1", &[])];
-        ctx.save().unwrap();
-        let status = call(
-            &server,
-            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"project_status","arguments":{"output_dir":dir.path()}}}),
-        )
-        .await;
-        let status: Value = serde_json::from_str(tool_text(&status)).unwrap();
-        assert_eq!(status["tasks"][0]["status"], "Pending");
-
-        let missing = call(
-            &server,
-            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"project_status","arguments":{"output_dir":"/nonexistent/dir"}}}),
-        )
-        .await;
-        assert_eq!(missing["result"]["isError"], true);
     }
 }

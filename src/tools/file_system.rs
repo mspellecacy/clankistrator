@@ -310,7 +310,7 @@ mod tests {
     async fn writes_outside_the_root_are_refused() {
         let (dir, sb) = sandbox();
         let write = WriteFile { sandbox: sb.clone() };
-        for path in ["../escaped.txt", "/tmp/clankistrator-escaped.txt", ".clankistrator/state.json"] {
+        for path in ["../escaped.txt", "/tmp/clankistrator-escaped.txt"] {
             let out = write
                 .call(WriteFileArgs { path: path.into(), content: "x".into() })
                 .await

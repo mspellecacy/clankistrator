@@ -4,24 +4,18 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-description = "Turns a Markdown design document into a task graph and runs LLM worker agents against it"
+description = "An MCP server with one tool, run_agent: it runs an agent on a model you name, in a project you name, with its commands in a jail"
 
 [dependencies]
 rig-core = "0.32.0"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-pulldown-cmark = "0.13"
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 dotenvy = "0.15"
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
-log = "0.4"
-ratatui = "0.30"
-crossterm = { version = "0.29", features = ["event-stream"] }
-tui-logger = { version = "0.18.1", features = ["tracing-support"] }
-tokio-stream = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 
 [target.'cfg(unix)'.dependencies]

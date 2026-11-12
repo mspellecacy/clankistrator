@@ -6,7 +6,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::llm::{AgentRequest, Llm, TokenUsage, check_credentials, resolve_model};
 use crate::tools::probe::GetCode;
@@ -105,28 +105,6 @@ pub async fn probe_model(llm: &dyn Llm, model: &str) -> ProbeReport {
     ProbeReport { model: model.to_string(), provider: format!("{provider:?}"), completion, tool_call }
 }
 
-/// Before a run: make one small request to every distinct model, so that a
-/// mistyped model name or a dead key stops the run now rather than after a
-/// worker has already spent tokens.
-pub async fn preflight(llm: &dyn Llm, models: &[&str]) -> Result<TokenUsage> {
-    let mut seen: Vec<&str> = Vec::new();
-    let mut usage = TokenUsage::default();
-    for model in models {
-        if seen.contains(model) {
-            continue;
-        }
-        seen.push(model);
-        match completion(llm, model).await {
-            Ok(used) => {
-                tracing::info!("Preflight: {model} answered a test request");
-                usage += used;
-            }
-            Err(e) => bail!("model {model} is not usable: {e}"),
-        }
-    }
-    Ok(usage)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,24 +180,6 @@ mod tests {
         assert!(report.tool_call.is_none());
         assert!(!report.passed());
         assert_eq!(llm.1.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn preflight_asks_each_distinct_model_once_and_stops_at_the_first_failure() {
-        let llm = Fake::new(working);
-        let usage = preflight(&llm, &["ollama:a", "ollama:b", "ollama:a"]).await.unwrap();
-        assert_eq!(*llm.1.lock().unwrap(), ["ollama:a", "ollama:b"]);
-        assert_eq!(usage.input_tokens, 18);
-
-        let llm = Fake::new(|request: &AgentRequest| {
-            if request.model == "ollama:judge-typo" {
-                Err(LlmError::Other(anyhow::anyhow!("404 model not found")))
-            } else {
-                Ok("READY".to_string())
-            }
-        });
-        let error = preflight(&llm, &["ollama:worker", "ollama:judge-typo"]).await.unwrap_err().to_string();
-        assert!(error.contains("ollama:judge-typo") && error.contains("404"), "{error}");
     }
 
     #[tokio::test]

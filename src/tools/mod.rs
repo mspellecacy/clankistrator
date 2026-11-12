@@ -5,8 +5,6 @@ use std::time::Duration;
 
 use rig::tool::ToolDyn;
 
-use crate::context::STATE_DIR;
-
 pub mod file_system;
 pub use file_system::{EditFile, ListFiles, ReadFile, WriteFile};
 
@@ -267,12 +265,9 @@ impl Sandbox {
             .collect()
     }
 
-    /// Like [`resolve`](Self::resolve), but also refuses Clankistrator's own state directory.
+    /// Like [`resolve`](Self::resolve), but also refuses the files that run unseen.
     pub fn resolve_for_write(&self, raw: &str) -> Result<PathBuf, String> {
         let full = self.resolve(raw)?;
-        if full.starts_with(self.root.join(STATE_DIR)) {
-            return Err(format!("{STATE_DIR}/ is reserved for the orchestrator and cannot be written"));
-        }
         if self.unseen_guarded {
             let real = real_path(&full);
             let unseen = RUNS_UNSEEN.iter().map(|path| (path, self.root.join(path)));
@@ -289,11 +284,11 @@ impl Sandbox {
 /// Which tools an agent is given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolAccess {
-    /// No tools (planning).
+    /// No tools (the probe's plain request).
     None,
-    /// Read files, list directories, run commands (review).
+    /// Read files, list directories, run commands.
     Inspect,
-    /// Inspect plus writing and editing files (workers).
+    /// Inspect plus writing and editing files (`write_access`).
     Full,
     /// Only the harmless probe tool, which returns the code for this token.
     Probe(u32),
@@ -375,13 +370,6 @@ mod tests {
         let after = sb.enclosing_projects();
         assert_eq!(after.len(), before.len() + 1);
         assert!(after.contains(&dir.path().canonicalize().unwrap().join("Cargo.toml")));
-    }
-
-    #[test]
-    fn state_directory_is_read_only_for_agents() {
-        let (_dir, sb) = sandbox();
-        assert!(sb.resolve_for_write(".clankistrator/state.json").is_err());
-        assert!(sb.resolve_for_write("src/lib.rs").is_ok());
     }
 
     #[test]
@@ -467,7 +455,7 @@ mod tests {
         assert_eq!(
             names(ToolAccess::Full),
             ["read_file", "list_files", "execute_command", "write_file", "edit_file"],
-            "only workers get the tools that change files"
+            "only write_access gets the tools that change files"
         );
         assert_eq!(names(ToolAccess::Probe(1)), ["get_code"], "the probe gets no file or command tools");
     }

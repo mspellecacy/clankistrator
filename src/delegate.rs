@@ -1,9 +1,8 @@
 //! Run one agent on a prompt in a project that already exists.
 //!
-//! This is the orchestrator's worker without the orchestrator: no design
-//! document, no task graph, no review. Whoever calls it (today the MCP
-//! server's `run_agent` tool) decides what the agent is for, and gets its
-//! final reply back, saved to a report file if one was named.
+//! No plan and no review: whoever calls it (the MCP server's `run_agent`
+//! tool) decides what the agent is for, and gets its final reply back, saved
+//! to a report file if one was named.
 //!
 //! Nothing is written to the project except what the agent itself writes and
 //! that report: a state directory would show up as an untracked path in
