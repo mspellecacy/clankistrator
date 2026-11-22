@@ -158,6 +158,39 @@ impl Drop for RunningCommand {
     }
 }
 
+/// A process group the program started for itself rather than for an agent
+/// (Codex's app server): killed when dropped, and by [`kill_running_commands`]
+/// when the program quits.
+pub(crate) struct OwnedProcessGroup(Option<u32>);
+
+impl OwnedProcessGroup {
+    pub(crate) fn new(pid: Option<u32>) -> Self {
+        if let Some(pid) = pid
+            && let Ok(mut running) = RUNNING.lock()
+        {
+            running.push(pid);
+        }
+        Self(pid)
+    }
+}
+
+impl Drop for OwnedProcessGroup {
+    fn drop(&mut self) {
+        let Some(pid) = self.0 else { return };
+        let registered = RUNNING
+            .lock()
+            .map(|mut running| {
+                let before = running.len();
+                running.retain(|p| *p != pid);
+                running.len() != before
+            })
+            .unwrap_or(false);
+        if registered {
+            kill_process_group(Some(pid));
+        }
+    }
+}
+
 impl ExecuteCommand {
     /// cargo looks for `Cargo.toml` in every parent directory. When the output
     /// directory sits inside another Rust project (this repository, say), a

@@ -1,3 +1,4 @@
+pub mod codex;
 pub mod delegate;
 pub mod llm;
 pub mod mcp;
@@ -23,7 +24,8 @@ const DEFAULT_MAX_TURNS: usize = 40;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// The only models an agent may run on, separated by commas, the default first. Each may
-    /// carry a provider prefix (openai:, anthropic:, gemini:, ollama:). What an agent reads is
+    /// carry a provider prefix (openai:, anthropic:, gemini:, ollama:, openrouter:, compatible:,
+    /// codex:). What an agent reads is
     /// sent to its model's provider, so the list is fixed here and a call cannot add to it
     #[arg(long, visible_alias = "workers", value_delimiter = ',', value_name = "MODEL,MODEL")]
     models: Vec<String>,

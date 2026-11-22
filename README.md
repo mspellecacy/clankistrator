@@ -8,7 +8,7 @@ Until November 2026 this project also turned a design document into a project wi
 
 ## Getting started
 
-Requirements: [Rust](https://rustup.rs/) 1.88 or newer, [bubblewrap](https://github.com/containers/bubblewrap) (Linux only; see Safety), and an API key for a provider, or a local Ollama. Bubblewrap 0.11.0 is the version this has been run with; `scratch` needs its overlay support, and the server checks for that when a call asks for it.
+Requirements: [Rust](https://rustup.rs/) 1.88 or newer, [bubblewrap](https://github.com/containers/bubblewrap) (Linux only; see Safety), and an API key for a provider, a local Ollama, or the Codex CLI logged in to a ChatGPT plan. Bubblewrap 0.11.0 is the version this has been run with; `scratch` needs its overlay support, and the server checks for that when a call asks for it.
 
 ```bash
 git clone https://github.com/mspellecacy/clankistrator.git
@@ -88,6 +88,7 @@ Agents read a project you already have, run programs on your machine and, if a c
   - with `write_access`, `.git/hooks`, `.git/config` and `.claude/settings.local.json` stay read-only, and the file tools refuse to write them: they run code later, outside the jail, and never show in a diff. If `.claude/settings.local.json` does not exist, the whole `.claude` directory is read-only to commands, because a file that is not there cannot be covered. That list is not everything that runs later: `node_modules`, build output, a submodule's own git directory and every other path git ignores stay writable, and none of them shows in a diff either. Give `write_access` only where you would let that model loose with a shell in that one directory.
 - **What the jail does not do.** It does not decide what the model's provider gets to see: everything the agent reads in the project goes there. It finds environment files by a bounded walk (six levels deep, skipping `.git`, `node_modules`, `target` and other build directories). It leaves the rest of the machine outside your home directory readable, as any local user could read it. With `--allow-network`, commands reach everything your machine reaches, including services on localhost. If the client is Claude Code, the project's permission rules and hooks still apply only to Claude's own tool calls; for an agent's commands the jail stands in for them.
 - **With `--no-jail`, commands are ordinary processes running as you.** `sh -c 'cat .env.production'` works, and so does `git push`.
+- **`codex:` models run Codex itself outside the jail.** Codex runs the model loop and could act on its own; see [OpenAI models through Codex](#openai-models-through-codex) for how that is refused.
 
 ## Options
 
@@ -123,6 +124,7 @@ A model is named as `prefix:model`. For three providers the prefix can be left o
 | Ollama | `ollama:` | a running server; `OLLAMA_BASE_URL` if it is not on `http://localhost:11434` | no |
 | OpenRouter | `openrouter:` | `OPENROUTER_API_KEY` (or `OPENROUTER_KEY`) | probe only, with two free models |
 | OpenAI-compatible server | `compatible:` | `OPENAI_COMPATIBLE_BASE_URL` (for example `http://localhost:1234/v1`); `OPENAI_COMPATIBLE_API_KEY` if the server wants one | no |
+| OpenAI through the Codex CLI | `codex:` | Codex installed and logged in; `CODEX_BIN` if it is not on the PATH | yes, with `gpt-6.2-sol`: probe and agent runs |
 
 "Run live" says whether that path has been exercised against the real service by the maintainers. The rows marked "no" compile and are wired up the same way, but nobody has seen them work; probe before you trust them. "Probe only" means a request and a tool call went through, and no agent run has been made through `run_agent`.
 
@@ -146,10 +148,24 @@ OpenRouter offers some models at no charge; their names end in `:free`. The list
 - **To make sure nothing is ever billed,** set `OPENROUTER_FREE_ONLY=true`. Any `openrouter:` model whose name does not end in `:free` is then refused before a request is sent.
 - **Free endpoints may keep and train on what you send.** An agent's prompts contain your project's code.
 
+### OpenAI models through Codex
+
+A `codex:` model (`codex:gpt-6.2-sol`, say) runs on the account the [Codex CLI](https://developers.openai.com/codex) is logged in with, usually a ChatGPT plan, instead of an API key. It sits beside `openai:`: `--models gpt-6-luna,codex:gpt-6.2-sol` offers both, the first billed to `OPENAI_API_KEY` and the second to the plan. `codex debug models` lists the names Codex knows.
+
+- **What it needs.** Codex installed and logged in (`codex login`; the server checks `codex login status` when it starts). Set `CODEX_BIN` if `codex` is not on the PATH your MCP client starts the server with.
+- **How it works.** For each run the server starts `codex app-server` and hands it the agent's tools. Codex runs the model loop, and every tool call comes back to the server and runs as it does for any other provider, commands in the jail. Codex is killed when the run ends.
+- **Codex's own tools are refused, not removed.** Codex offers the model tools of its own besides the agent's (`apply_patch`, subagents, a JavaScript `exec` through which the agent's tools are called), and not all of them can be switched off. The server switches off what it can and gives Codex's thread no execution environment, a read-only sandbox and approval for everything, and does not use a thread that comes back otherwise. Without an environment, Codex's file and command tools have nowhere to act: asked to use them, they failed and the model carried on without them. Should Codex still try, the server refuses every approval it asks for and stops the run at the first sign of anything that is not a message, reasoning or a call of the agent's tools, or of work in another thread. That matters for subagents: Codex has no setting that removes them, and the model can start one. A run is not started if Codex would bring MCP servers or instruction files (`AGENTS.md`) of its own.
+- **Codex itself runs outside the jail, as you,** because it needs its login. It starts in an empty directory of its own, not in the project. With `--no-jail`, an agent's commands can read Codex's login in `~/.codex`.
+- **Turns.** `--max-turns` counts the model's responses. One response can call tools many times from a single `exec` script, so it does not cap tool calls.
+- **Cost.** Runs count against the plan's usage limits, not API billing. When the limit is reached the run fails and says so. Each request carries about 4,000 to 5,000 tokens of Codex's own instructions and tool descriptions, most of which come from the cache after the first.
+- **The server introduces itself to Codex as `clankistrator`**, and Codex passes that name on to OpenAI with every request.
+- **Codex marks the protocol this uses as experimental**, so a Codex update can break it. It was written against codex-cli 0.171.0. Probe after you update Codex.
+
 ## What has been run live
 
 - **From Claude Code, 2026-11-11.** A reviewer agent file written for Claude Code ran unchanged against a private repository on `claude-haiku-5-5` and on `gpt-6-luna`, and both returned a report in the format the file asks for. Those two runs were before the jail existed, inside a bubblewrap wrapper around the whole server.
 - **The jail, 2026-11-11.** Two canary agents on `claude-haiku-5-5` tried what it forbids. Read-only: creating a file, reading environment files, listing the home directory, Docker, the network and the server's environment through `/proc` all failed, while `git diff` and `node` worked and a 25-second command ran to its end. With `write_access`, in a scratch repository: writing files and `git commit` worked, and `.git/hooks`, `.git/config` and `.claude/settings.local.json` could not be written by a command or by `write_file`.
+- **Codex, 2026-11-20.** `--probe codex:gpt-6.2-sol` passed on a ChatGPT login with codex-cli 0.171.0. On 2026-11-21 and 22, through `run_agent`, jailed, in scratch repositories: a read-only run listed files, read one and ran `python3` and `git log`; a `write_access` run created and edited files, and `write_file` refused `.git/hooks/pre-commit`; a `scratch` run changed a file with `sed` and the project stayed clean; a 45-second command finished, past `exec`'s 30-second yield; and a run cancelled mid-command stopped Codex and the jailed command within two seconds. Asked to use `apply_patch`, Codex's `exec_command` or a subagent, the model declined each time, citing the developer instructions. With a build that left those instructions out, it still declined `apply_patch` and `exec_command`. It did start a subagent (with `fork_turns: "none"`; without it, the spawn failed on the ephemeral thread). The server stopped that run at Codex's first `subAgentActivity` item, in 3 seconds, and nothing was written. Before that, in a session driven by hand with nearly the same settings (without the last three `-c` settings, the developer instructions and the empty directory), the model was asked to create a file with `apply_patch`, to run a shell command, and to start a subagent. The first two found no environment to run in, the subagent failed to start, and nothing was written.
 - **Not yet through an agent:** a worktree (tests only), and `--allow-network` (only its mounts were tried by hand, where a name resolved and an HTTPS request went through).
 
 ## Limitations
@@ -171,7 +187,8 @@ src/
 ├── main.rs            Command line, settings, the jail policy, the probe report
 ├── mcp.rs             The MCP server and the usage log
 ├── delegate.rs        One agent on one prompt in an existing project
-├── llm.rs             Provider selection, retries, and the single call into rig
+├── llm.rs             Provider selection, retries, and the call into rig
+├── codex.rs           codex: models, through `codex app-server`
 ├── probe.rs           The model check behind --probe
 └── tools/             File tools, command execution, and the jail
 integrations/          Files other tools need to use this server

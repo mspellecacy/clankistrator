@@ -1,4 +1,5 @@
-//! The single place where Clankistrator talks to a model provider.
+//! Where Clankistrator talks to a model provider: through rig, or for
+//! `codex:` models through the Codex CLI (see [`crate::codex`]).
 //!
 //! Everything else goes through the [`Llm`] trait, which keeps the rest
 //! testable with scripted replies.
@@ -281,7 +282,7 @@ impl TokenUsage {
     /// inside its input total. Anthropic reports three separate numbers:
     /// uncached input, input read from the cache, and input written to the
     /// cache (`cache_writes`, which rig's own usage figures leave out).
-    fn normalised(provider: Provider, input: u64, cached: u64, cache_writes: u64, output: u64) -> Self {
+    pub(crate) fn normalised(provider: Provider, input: u64, cached: u64, cache_writes: u64, output: u64) -> Self {
         let input_tokens = match provider {
             Provider::Anthropic => input + cached + cache_writes,
             _ => input.max(cached),
@@ -330,6 +331,9 @@ pub enum Provider {
     /// Any server that speaks the OpenAI chat-completions protocol
     /// (LM Studio, vLLM, llama.cpp, a gateway), at a URL you supply.
     OpenAiCompatible,
+    /// OpenAI's models through the Codex CLI, on the account Codex is logged
+    /// in with (a ChatGPT plan, say) instead of an API key. See [`crate::codex`].
+    Codex,
 }
 
 /// Where an OpenAI-compatible server is, and its key if it wants one.
@@ -337,13 +341,14 @@ pub const COMPATIBLE_URL_VAR: &str = "OPENAI_COMPATIBLE_BASE_URL";
 pub const COMPATIBLE_KEY_VAR: &str = "OPENAI_COMPATIBLE_API_KEY";
 
 impl Provider {
-    pub const ALL: [Provider; 6] = [
+    pub const ALL: [Provider; 7] = [
         Provider::OpenAi,
         Provider::Anthropic,
         Provider::Gemini,
         Provider::Ollama,
         Provider::OpenRouter,
         Provider::OpenAiCompatible,
+        Provider::Codex,
     ];
 
     /// The prefix that selects this provider in a model spec.
@@ -355,6 +360,7 @@ impl Provider {
             Provider::Ollama => "ollama",
             Provider::OpenRouter => "openrouter",
             Provider::OpenAiCompatible => "compatible",
+            Provider::Codex => "codex",
         }
     }
 
@@ -366,7 +372,8 @@ impl Provider {
             Provider::Anthropic => &["ANTHROPIC_API_KEY"],
             Provider::Gemini => &["GEMINI_API_KEY"],
             Provider::OpenRouter => &["OPENROUTER_API_KEY", "OPENROUTER_KEY"],
-            Provider::Ollama | Provider::OpenAiCompatible => &[],
+            // Codex has its own login, checked with `codex login status`.
+            Provider::Ollama | Provider::OpenAiCompatible | Provider::Codex => &[],
         }
     }
 }
@@ -377,6 +384,8 @@ pub fn secret_env_vars() -> Vec<&'static str> {
     let mut vars: Vec<&'static str> =
         Provider::ALL.iter().flat_map(|provider| provider.key_vars().iter().copied()).collect();
     vars.push(COMPATIBLE_KEY_VAR);
+    // Codex reads an API key from this variable instead of its own login.
+    vars.push("CODEX_API_KEY");
     vars
 }
 
@@ -385,8 +394,8 @@ pub fn secret_env_vars() -> Vec<&'static str> {
 /// An explicit `provider:model` prefix always wins (`ollama:llama3.2`,
 /// `anthropic:claude-...`). Without one, names starting with `claude` go to
 /// Anthropic, names starting with `gemini` go to Gemini, and everything else
-/// goes to OpenAI. Ollama, OpenRouter and OpenAI-compatible servers are only
-/// ever chosen by prefix.
+/// goes to OpenAI. Ollama, OpenRouter, OpenAI-compatible servers and Codex are
+/// only ever chosen by prefix.
 pub fn resolve_model(spec: &str) -> (Provider, &str) {
     let spec = spec.trim();
     if let Some((prefix, rest)) = spec.split_once(':') {
@@ -397,6 +406,7 @@ pub fn resolve_model(spec: &str) -> (Provider, &str) {
             "ollama" => Some(Provider::Ollama),
             "openrouter" => Some(Provider::OpenRouter),
             "compatible" | "openai-compatible" => Some(Provider::OpenAiCompatible),
+            "codex" => Some(Provider::Codex),
             _ => None,
         };
         if let Some(provider) = provider {
@@ -438,6 +448,9 @@ pub fn check_credentials(model_spec: &str) -> Result<()> {
     let (provider, model) = resolve_model(model_spec);
     if model.is_empty() {
         bail!("model name is empty");
+    }
+    if provider == Provider::Codex {
+        return crate::codex::check_login();
     }
     if provider == Provider::OpenAiCompatible && compatible_base_url().is_none() {
         bail!(
@@ -595,6 +608,8 @@ impl RigLlm {
                     .completions_api();
                 run_agent!(AgentBuilder::new(Steady::new(client.completion_model(model))), request, no_limit)
             }
+            // Codex runs the agent's loop itself; only the tool calls come back here.
+            Provider::Codex => return crate::codex::run(request, model).await,
             Provider::Ollama => {
                 let mut builder = ollama::Client::builder().api_key(Nothing);
                 if let Some(url) = ollama_base_url() {
@@ -665,6 +680,9 @@ mod tests {
         );
         assert_eq!(resolve_model("compatible:qwen2.5-coder"), (Provider::OpenAiCompatible, "qwen2.5-coder"));
         assert_eq!(resolve_model("openai-compatible:x"), (Provider::OpenAiCompatible, "x"));
+        assert_eq!(resolve_model("codex:gpt-6.2-sol"), (Provider::Codex, "gpt-6.2-sol"));
+        // Only the prefix selects Codex.
+        assert_eq!(resolve_model("codex-auto-review").0, Provider::OpenAi);
         // Without the prefix, a vendor-style name is NOT sent to OpenRouter.
         assert_eq!(resolve_model("anthropic/claude-x").0, Provider::OpenAi);
         for provider in Provider::ALL {
@@ -842,7 +860,7 @@ mod tests {
                 assert!(secrets.contains(var), "{var} is missing");
             }
         }
-        for var in ["OPENROUTER_API_KEY", "OPENROUTER_KEY", COMPATIBLE_KEY_VAR] {
+        for var in ["OPENROUTER_API_KEY", "OPENROUTER_KEY", COMPATIBLE_KEY_VAR, "CODEX_API_KEY"] {
             assert!(secrets.contains(&var), "{var} is missing");
         }
     }
