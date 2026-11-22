@@ -19,6 +19,7 @@ use rig::streaming::StreamingCompletionResponse;
 use tokio::time::Instant;
 
 use crate::tools::{Sandbox, ToolAccess};
+use crate::transcript::Transcript;
 
 /// Upper bound on one agent run (all of its turns), so a stalled connection
 /// cannot hang the server's caller forever. `--run-timeout` replaces it.
@@ -257,6 +258,19 @@ pub struct AgentRequest {
     pub tools: ToolAccess,
     pub sandbox: Sandbox,
     pub max_turns: usize,
+    /// Where the run's tool calls and model responses are recorded, if anywhere.
+    pub transcript: Option<Transcript>,
+}
+
+impl AgentRequest {
+    /// The agent's tools, each call recorded in the run's transcript if it has one.
+    pub fn build_tools(&self) -> Vec<Box<dyn rig::tool::ToolDyn>> {
+        let tools = self.tools.build(&self.sandbox);
+        match &self.transcript {
+            Some(transcript) => crate::transcript::recorded(tools, transcript),
+            None => tools,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -301,6 +315,8 @@ pub struct LlmReply {
 pub enum LlmError {
     /// The agent used all of its turns without producing a final answer.
     MaxTurns(usize),
+    /// The run took longer than `--run-timeout` allows.
+    TimedOut(Duration),
     Other(anyhow::Error),
 }
 
@@ -308,6 +324,11 @@ impl std::fmt::Display for LlmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LlmError::MaxTurns(n) => write!(f, "the agent used all {n} turns without finishing"),
+            LlmError::TimedOut(limit) => write!(
+                f,
+                "the model did not finish within {} minutes (--run-timeout raises the limit)",
+                limit.as_secs() / 60
+            ),
             LlmError::Other(e) => write!(f, "{e:#}"),
         }
     }
@@ -497,11 +518,44 @@ impl Default for RigLlm {
     }
 }
 
+/// Writes each model response to the run's transcript, if it has one, with
+/// its tokens counted as the run's totals are.
+#[derive(Clone)]
+struct Recorder(Option<Transcript>, Provider);
+
+impl Recorder {
+    fn response<T>(&self, response: &CompletionResponse<T>, cache_writes: u64) {
+        if let Some(transcript) = &self.0 {
+            let usage = &response.usage;
+            let usage = TokenUsage::normalised(
+                self.1,
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                cache_writes,
+                usage.output_tokens,
+            );
+            transcript.response(&response.choice, &usage);
+        }
+    }
+}
+
+impl<M: CompletionModel> PromptHook<M> for Recorder {
+    fn on_completion_response(
+        &self,
+        _prompt: &rig::completion::Message,
+        response: &CompletionResponse<M::Response>,
+    ) -> impl Future<Output = HookAction> + Send {
+        self.response(response, 0);
+        async { HookAction::cont() }
+    }
+}
+
 /// Adds up the tokens Anthropic says were written to its prompt cache. rig
 /// drops this number when it converts a response, so without the hook a
-/// request that fills the cache would look almost free.
-#[derive(Clone, Default)]
-struct CacheWriteCounter(Arc<AtomicU64>);
+/// request that fills the cache would look almost free. It records each
+/// response as well, since an agent takes only one hook.
+#[derive(Clone)]
+struct CacheWriteCounter(Arc<AtomicU64>, Recorder);
 
 impl PromptHook<Steady<anthropic::completion::CompletionModel>> for CacheWriteCounter {
     fn on_completion_response(
@@ -511,6 +565,7 @@ impl PromptHook<Steady<anthropic::completion::CompletionModel>> for CacheWriteCo
     ) -> impl Future<Output = HookAction> + Send {
         let written = response.raw_response.usage.cache_creation_input_tokens.unwrap_or(0);
         self.0.fetch_add(written, Ordering::Relaxed);
+        self.1.response(response, written);
         async { HookAction::cont() }
     }
 }
@@ -519,7 +574,7 @@ impl PromptHook<Steady<anthropic::completion::CompletionModel>> for CacheWriteCo
 /// generic function because each provider has its own client and model types.
 macro_rules! run_agent {
     ($builder:expr, $request:expr, $max_tokens:expr) => {
-        run_agent!($builder, $request, $max_tokens, ())
+        run_agent!($builder, $request, $max_tokens, Recorder($request.transcript.clone(), resolve_model(&$request.model).0))
     };
     ($builder:expr, $request:expr, $max_tokens:expr, $hook:expr) => {{
         let request: &AgentRequest = $request;
@@ -527,7 +582,7 @@ macro_rules! run_agent {
         if let Some(max_tokens) = $max_tokens {
             builder = builder.max_tokens(max_tokens);
         }
-        let tools = request.tools.build(&request.sandbox);
+        let tools = request.build_tools();
         let agent = if tools.is_empty() {
             builder.build()
         } else {
@@ -550,7 +605,7 @@ impl RigLlm {
         let key = api_key(provider).map_err(LlmError::Other)?;
         let client_error = |e| LlmError::Other(anyhow!("could not create the {provider:?} client: {e}"));
         let no_limit: Option<u64> = None;
-        let cache_writes = CacheWriteCounter::default();
+        let cache_writes = CacheWriteCounter(Arc::default(), Recorder(request.transcript.clone(), provider));
 
         let result = match provider {
             Provider::OpenAi => {
@@ -643,10 +698,7 @@ impl Llm for RigLlm {
             let limit = agent_run_timeout();
             match tokio::time::timeout(limit, self.dispatch(&request)).await {
                 Ok(result) => result,
-                Err(_) => Err(LlmError::Other(anyhow!(
-                    "the model did not finish within {} minutes (--run-timeout raises the limit)",
-                    limit.as_secs() / 60
-                ))),
+                Err(_) => Err(LlmError::TimedOut(limit)),
             }
         })
     }

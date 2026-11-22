@@ -647,6 +647,7 @@ mod tests {
             (root.join(".env.local"), "KEY=ROOT-ENV"),
             (root.join("nested/.env.production"), "KEY=NESTED-ENV"),
             (root.join("private/notes.txt"), "PRIVATE-NOTES"),
+            (root.join("notes.md"), "HIDDEN-FILE"),
             (root.join(".git/config"), "[core]\n"),
         ] {
             std::fs::write(file, text).unwrap();
@@ -670,7 +671,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_jailed_command_sees_the_project_and_nothing_else_of_the_users() {
-        let Some((_dir, tool)) = jailed(Writes::Refused, Duration::from_secs(20), &["private"], &["tools"]) else { return };
+        let Some((_dir, tool)) =
+            jailed(Writes::Refused, Duration::from_secs(20), &["private", "notes.md"], &["tools"])
+        else {
+            return;
+        };
 
         let out = tool.run(&sh("cat source.txt && cat ../../tools/hello")).await;
         assert!(out.contains("SOURCE") && out.contains("TOOLCHAIN"), "{out}");
@@ -688,6 +693,11 @@ mod tests {
         }
         assert!(out.contains("PRIVATE=[]"), "{out}");
 
+        // A hidden file reads as empty, so a build that reads every file under a directory still works.
+        let out = tool.run(&sh("cat notes.md .env.local nested/.env.production && echo READ-ALL")).await;
+        assert!(out.contains("READ-ALL") && !out.contains("HIDDEN-FILE"), "{out}");
+        assert!(!out.contains("Permission denied"), "{out}");
+
         // Read-only, and nothing of this process: not its environment, its /proc entry or its network.
         let out = tool.run(&sh("echo x > new.txt")).await;
         assert!(out.contains("Read-only file system"), "{out}");
@@ -697,6 +707,23 @@ mod tests {
         assert!(out.contains("NICS=1"), "only the loopback interface: {out}");
         let pids: usize = out.split("PIDS=").nth(1).unwrap().lines().next().unwrap().parse().unwrap();
         assert!(pids < 10, "a private process namespace: {out}");
+    }
+
+    #[tokio::test]
+    async fn a_hidden_file_that_runs_unseen_reads_as_empty_in_a_writable_jail() {
+        // Covered against writes and hidden, both: the case a build failed on with "Permission denied".
+        let hidden = [".claude/settings.local.json"];
+        let Some((_dir, tool)) = jailed(Writes::Project, Duration::from_secs(20), &hidden, &[]) else { return };
+        let root = tool.sandbox.root().to_path_buf();
+        std::fs::write(root.join(".claude/settings.local.json"), "LOCAL-SECRET").unwrap();
+
+        // What a build that reads a whole directory does.
+        let out = tool.run(&sh("find .claude -type f -exec cat {} + && echo READ-ALL")).await;
+        assert!(out.contains("READ-ALL") && !out.contains("LOCAL-SECRET"), "{out}");
+        assert!(!out.contains("Permission denied"), "{out}");
+        let out = tool.run(&sh("echo evil > .claude/settings.local.json")).await;
+        assert!(out.contains("Read-only file system"), "{out}");
+        assert_eq!(std::fs::read_to_string(root.join(".claude/settings.local.json")).unwrap(), "LOCAL-SECRET");
     }
 
     #[tokio::test]

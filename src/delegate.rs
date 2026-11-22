@@ -11,8 +11,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde_json::{Value, json};
+
 use crate::llm::{AgentRequest, Llm, LlmError, TokenUsage, check_credentials};
 use crate::tools::{JailPolicy, Sandbox, ToolAccess, Writes};
+use crate::transcript::Transcript;
 
 /// Where a project keeps the agent definitions that can be named without a path.
 const AGENTS_DIR: &str = ".claude/agents";
@@ -59,12 +62,45 @@ pub struct Summary {
     pub model: String,
     /// "read", "write" or "scratch".
     pub access: &'static str,
+    /// The report file as the caller named it, which says what the run was
+    /// for when the caller's paths follow a pattern.
+    pub report_path: Option<String>,
 }
 
 impl Prepared {
     pub fn summary(&self) -> &Summary {
         &self.summary
     }
+
+    /// Everything the agent is given, for the start of its transcript: the
+    /// instructions it runs under (these rules and its agent file) and the prompt.
+    pub fn describe(&self) -> Value {
+        json!({
+            "directory": self.summary.directory,
+            "agent": self.summary.agent,
+            "model": self.summary.model,
+            "access": self.summary.access,
+            "report_path": self.summary.report_path,
+            "max_turns": self.request.max_turns,
+            "instructions": self.request.preamble,
+            "prompt": self.request.prompt,
+        })
+    }
+
+    /// Record the run's tool calls and model responses in `transcript`.
+    pub fn record_to(&mut self, transcript: Transcript) {
+        self.request.transcript = Some(transcript);
+    }
+}
+
+/// Why a run did not end with a reply.
+#[derive(Debug)]
+pub struct Failure {
+    /// One of a few words, for the usage log: "max_turns", "timed_out",
+    /// "report_not_saved" or "error".
+    pub kind: &'static str,
+    /// What the caller is told.
+    pub message: String,
 }
 
 #[derive(Debug)]
@@ -347,6 +383,7 @@ pub fn prepare(delegation: Delegation) -> Result<Prepared, String> {
     let mut preamble =
         rules(write_access, scratch, report.as_ref().map(|r| r.given.as_str()), command_timeout, jail.as_ref());
     let summary = Summary {
+        report_path: report.as_ref().map(|report| report.given.clone()),
         directory: sandbox.root().to_path_buf(),
         agent: agent.as_deref().map(str::trim).filter(|agent| !agent.is_empty()).map(str::to_string),
         model: model.clone(),
@@ -370,6 +407,7 @@ pub fn prepare(delegation: Delegation) -> Result<Prepared, String> {
             tools: if write_access { ToolAccess::Full } else { ToolAccess::Inspect },
             sandbox,
             max_turns: max_turns.max(1),
+            transcript: None,
         },
         report,
         summary,
@@ -386,7 +424,7 @@ pub fn prepare(delegation: Delegation) -> Result<Prepared, String> {
 ///
 /// On failure nothing is written: a report file from an earlier run stays as
 /// it is, and the error says that the agent may have left work half done.
-pub async fn run(llm: &dyn Llm, prepared: Prepared) -> Result<Outcome, String> {
+pub async fn run(llm: &dyn Llm, prepared: Prepared) -> Result<Outcome, Failure> {
     let Prepared { request, report, summary: _ } = prepared;
     let model = request.model.clone();
     let root = request.sandbox.root().to_path_buf();
@@ -395,18 +433,25 @@ pub async fn run(llm: &dyn Llm, prepared: Prepared) -> Result<Outcome, String> {
 
     tracing::info!("Agent ({model}) starting in {}", root.display());
     let reply = llm.run(request).await.map_err(|e| {
-        let cause = match e {
-            LlmError::MaxTurns(turns) => format!(
-                "it used all {turns} turns without a final reply (max_turns raises the limit for one call, \
-                 --max-turns for the server)"
+        let (kind, cause) = match e {
+            LlmError::MaxTurns(turns) => (
+                "max_turns",
+                format!(
+                    "it used all {turns} turns without a final reply (max_turns raises the limit for one call, \
+                     --max-turns for the server)"
+                ),
             ),
-            LlmError::Other(e) => format!("{e:#}"),
+            LlmError::TimedOut(_) => ("timed_out", e.to_string()),
+            LlmError::Other(e) => ("error", format!("{e:#}")),
         };
-        format!(
-            "The agent did not finish: {cause}. It wrote no report, and it may have left files in {} \
-             half changed; look at the tree before running anything else on it.",
-            root.display()
-        )
+        Failure {
+            kind,
+            message: format!(
+                "The agent did not finish: {cause}. It wrote no report, and it may have left files in {} \
+                 half changed; look at the tree before running anything else on it.",
+                root.display()
+            ),
+        }
     })?;
     tracing::info!("Agent ({model}) finished");
 
@@ -422,10 +467,13 @@ pub async fn run(llm: &dyn Llm, prepared: Prepared) -> Result<Outcome, String> {
                     .map_or(Ok(()), std::fs::create_dir_all)
                     .and_then(|_| std::fs::write(&report.path, &reply.text));
                 if let Err(e) = saved {
-                    return Err(format!(
-                        "The agent finished, but its report could not be saved to {}: {e}. Its reply was:\n\n{}",
-                        report.given, reply.text
-                    ));
+                    return Err(Failure {
+                        kind: "report_not_saved",
+                        message: format!(
+                            "The agent finished, but its report could not be saved to {}: {e}. Its reply was:\n\n{}",
+                            report.given, reply.text
+                        ),
+                    });
                 }
             }
             Some(SavedReport { path: report.given, written_by_agent })
@@ -743,7 +791,9 @@ pub(crate) mod tests {
         d.report_path = Some("report.md".into());
 
         let llm = ActingLlm::new(|_| Err("401 Unauthorized".to_string()));
-        let error = run(&llm, prepare(d.clone()).unwrap()).await.unwrap_err();
+        let failure = run(&llm, prepare(d.clone()).unwrap()).await.unwrap_err();
+        assert_eq!(failure.kind, "error");
+        let error = failure.message;
         assert!(error.contains("401 Unauthorized"), "{error}");
         assert!(error.contains("half changed"), "{error}");
         assert_eq!(std::fs::read_to_string(dir.path().join("report.md")).unwrap(), "from an earlier round");
@@ -752,7 +802,7 @@ pub(crate) mod tests {
         // Not even a passing failure starts the agent again: the second agent
         // would find the first one's half-finished work and not know it.
         let llm = ActingLlm::new(|_| Err("503 Service Unavailable: overloaded".to_string()));
-        let error = run(&llm, prepare(d.clone()).unwrap()).await.unwrap_err();
+        let error = run(&llm, prepare(d.clone()).unwrap()).await.unwrap_err().message;
         assert!(error.contains("overloaded"), "{error}");
         assert_eq!(llm.requests.lock().unwrap().len(), 1, "the agent is started exactly once");
 
@@ -762,8 +812,19 @@ pub(crate) mod tests {
                 Box::pin(async move { Err(LlmError::MaxTurns(request.max_turns)) })
             }
         }
-        let error = run(&OutOfTurns, prepare(d).unwrap()).await.unwrap_err();
-        assert!(error.contains("used all 7 turns"), "{error}");
+        let failure = run(&OutOfTurns, prepare(d.clone()).unwrap()).await.unwrap_err();
+        assert_eq!(failure.kind, "max_turns");
+        assert!(failure.message.contains("used all 7 turns"), "{}", failure.message);
+
+        struct TooSlow;
+        impl Llm for TooSlow {
+            fn run<'a>(&'a self, _request: AgentRequest) -> LlmFuture<'a> {
+                Box::pin(async move { Err(LlmError::TimedOut(Duration::from_secs(1800))) })
+            }
+        }
+        let failure = run(&TooSlow, prepare(d).unwrap()).await.unwrap_err();
+        assert_eq!(failure.kind, "timed_out");
+        assert!(failure.message.contains("within 30 minutes"), "{}", failure.message);
     }
 
     #[tokio::test]

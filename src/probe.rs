@@ -46,6 +46,7 @@ fn request(model: &str, preamble: &str, prompt: String, tools: ToolAccess, max_t
         tools,
         sandbox: idle_sandbox()?,
         max_turns,
+        transcript: None,
     })
 }
 

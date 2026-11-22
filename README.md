@@ -34,7 +34,8 @@ claude mcp add-json --scope local clankistrator '{
     "--max-turns", "80", "--command-timeout", "900",
     "--allow-read", "/home/you/.nvm/versions/node/v25.2.0",
     "--hide", "tmp/private",
-    "--usage-log", "/home/you/.local/state/clankistrator/usage.jsonl"
+    "--usage-log", "/home/you/.local/state/clankistrator/usage.jsonl",
+    "--transcript-dir", "/home/you/.local/state/clankistrator/transcripts"
   ]
 }'
 ```
@@ -54,7 +55,7 @@ A run makes real, billed model calls. An agent sends its whole conversation agai
 | `report_path` | A file inside the directory for the agent's report. If the agent does not write it, its final reply is saved there |
 | `max_turns` | Model turns for this call, instead of the server's `--max-turns` |
 
-The result is JSON: the model, the reply, where the report went and who wrote it, how many seconds the run took, and the token counts the provider reported (input as one total, with the part read from the cache beside it).
+The result is JSON: the model, the reply, where the report went and who wrote it, how many seconds the run took, the token counts the provider reported (input as one total, with the part read from the cache beside it), the run's id, and its transcript when the server keeps them.
 
 What to know:
 
@@ -62,14 +63,15 @@ What to know:
 - **Settings do not come from the current directory.** A client usually starts the server inside the project the agents will work on, where `.env.local` is the project's own: reading it would bill the project's provider key and pass its settings on to every command. The server reads the environment and `--env-file`, nothing else.
 - **Agent files written for Claude Code mostly work as they are.** The agent is told which tools it has here and which of Claude Code's they stand for. It has no skills, slash commands, subagents or MCP tools, and is told to stop and say so if its instructions need one, so an agent that only wraps `/code-review` cannot be run this way.
 - **Nothing is written to the project** except what the agent writes and the report.
-- **A failed run** (a provider error, or all turns used without a final reply) writes no report and leaves an earlier one alone. The files may be half changed; the error says so.
+- **A failed run** (a provider error, or all turns used without a final reply) writes no report and leaves an earlier one alone. The files may be half changed; the error says so, and names the run and its transcript.
 - **One agent, started once.** A request that a provider turns away for a passing reason (rate limit, overload, a dropped connection) is sent again up to three times with growing waits. An agent that fails is not started again: a second one would begin with an empty context on files the first had half changed. An agent run ends after 30 minutes at the latest, or after `--run-timeout` minutes.
 - **Stopping.** When the client cancels the call (MCP's `notifications/cancelled`) or goes away (its end of stdin closes), the agent is stopped and the commands it started are killed. While an agent works, the server keeps answering other requests and, if the client asked for progress, sends it a progress notification every minute, so that a long run is not taken for a dead one. Claude Code does send that cancellation: on 2026-11-11 a run it had moved to the background was stopped from Claude Code, and its command was killed, its scratch layer deleted and the run logged as cancelled. Whether it asks for progress has not been observed; the server's log (stderr) says so for each run.
 - **`scratch` is for an agent that has to change code to test it,** such as a reviewer running a mutation check. Its commands see the project through an overlay whose writes go to a directory of their own, so a change stays for the agent's later commands and never reaches the project; nothing of yours is bound writable, a worktree's repository included. The agent gets no file-writing tools, and `read_file` goes on showing the real file, which it is told. Commands in a scratch run take turns. The layer is deleted when the run ends, is cancelled or times out; a server that is killed outright leaves a `clankistrator-run-*` directory in the temporary directory. Where `/tmp` is kept in memory, set `TMPDIR` for the server to a directory on disk.
-- **An environment file that git tracks shows as modified inside the jail** (` M` in `git status`), because the jail covers it with an unreadable file. It is not refused, as a tracked hidden path is, so tell an agent that stages files about it, or stop tracking the file.
+- **An environment file that git tracks shows as modified inside the jail** (` M` in `git status`), because the jail covers it with an empty file. It is not refused, as a tracked hidden path is, so tell an agent that stages files about it, or stop tracking the file.
 - **`/tmp` belongs to the run.** Each command is a jail of its own, so a jailed agent gets a `/tmp` that lasts from one command to the next, where it can keep notes, snapshots and scripts. It is a directory only you can read, and it is deleted with the run.
 - **A hidden path that git tracks is refused,** with its name, before any model is called. Inside the jail git would report its files as deleted, which an agent may stage or put in its report, and hiding it protects nothing: the content is in the repository's history.
-- **`--usage-log` keeps a line per run:** time, directory, agent, model, access (`read`, `write` or `scratch`), outcome (`ok`, `failed` or `cancelled`), seconds and token counts. It never holds a prompt, a reply or an error text, and a line that cannot be written does not fail the run.
+- **`--usage-log` keeps a line per run:** time, the run's id, directory, agent, model, access (`read`, `write` or `scratch`), the `report_path` the call named, outcome (`ok`, `failed` or `cancelled`), for a failure its kind (`error`, `max_turns`, `timed_out` or `report_not_saved`), seconds, token counts, the server's version with the commit it was built from, and the run's transcript. It never holds a prompt, a reply or an error text, and a line that cannot be written does not fail the run. A caller that names its reports by pattern (`tmp/jumpstart/ship-1590-impl-r1.md`) can tell from `report_path` which piece of its own work each line was.
+- **`--transcript-dir` keeps a transcript of each run,** so that a run can be audited afterwards the way a Claude Code agent's can: `<run id>.jsonl`, one JSON object per line, each with its `event` and the milliseconds since the run started. `start` has the instructions the agent ran under (the server's rules and its agent file), the prompt and the call's settings; `tool_call` and `tool_result` each tool call, with its arguments and output (each cut to 16 KiB, with its full size beside it); `response` each model response with its text, its reasoning where the provider shows it, the tools it called and its tokens (for `codex:` models, `message`, `reasoning` and `response` come separately, with `codex` naming Codex's version and `codex_retry` each request Codex sent again); and `end` the reply or the error. A run that was cancelled ends with `"outcome": "cancelled"`, after the call it was in. The directory is created for you, only you can enter it, and only you can read the files. A transcript that cannot be written does not fail the run.
 - **Commands are jailed** (see Safety). A toolchain installed under your home directory, such as node from nvm or cargo from rustup, is not there until you name it with `--allow-read`; a command that needs it fails with "No such file or directory". What the jail allows is settled on the server's command line, and no argument of `run_agent` loosens it. A `report_path` under a hidden path is refused.
 
 ## Safety
@@ -82,12 +84,13 @@ Agents read a project you already have, run programs on your machine and, if a c
 - **Commands run in a jail built with bubblewrap** (Linux only). The server does not start where it cannot build one, unless you pass `--no-jail`. In the jail:
   - the project is the only part of your files that is there, read-only unless the call gave `write_access`;
   - your home directory is empty apart from the paths you name with `--allow-read`, so there are no SSH keys, no CLI logins and no other projects;
-  - environment files in the project cannot be opened, and the paths you name with `--hide` are empty (the file tools refuse those too);
+  - environment files in the project, and the files you name with `--hide`, read as empty, and the directories you name with `--hide` are empty (the file tools refuse all of those);
   - there is no network unless you pass `--allow-network`, no Docker socket, and none of the session's sockets (SSH agent, keyring, D-Bus);
   - the environment is a short list of harmless variables, and the server's own environment, which holds the provider keys, cannot be read through `/proc`;
   - with `write_access`, `.git/hooks`, `.git/config` and `.claude/settings.local.json` stay read-only, and the file tools refuse to write them: they run code later, outside the jail, and never show in a diff. If `.claude/settings.local.json` does not exist, the whole `.claude` directory is read-only to commands, because a file that is not there cannot be covered. That list is not everything that runs later: `node_modules`, build output, a submodule's own git directory and every other path git ignores stay writable, and none of them shows in a diff either. Give `write_access` only where you would let that model loose with a shell in that one directory.
 - **What the jail does not do.** It does not decide what the model's provider gets to see: everything the agent reads in the project goes there. It finds environment files by a bounded walk (six levels deep, skipping `.git`, `node_modules`, `target` and other build directories). It leaves the rest of the machine outside your home directory readable, as any local user could read it. With `--allow-network`, commands reach everything your machine reaches, including services on localhost. If the client is Claude Code, the project's permission rules and hooks still apply only to Claude's own tool calls; for an agent's commands the jail stands in for them.
 - **With `--no-jail`, commands are ordinary processes running as you.** `sh -c 'cat .env.production'` works, and so does `git push`.
+- **A transcript holds what the agent saw:** the project's code and its commands' output, which can include what a database or a test printed. Keep `--transcript-dir` where you would keep the project. It never holds a provider's own traffic, so not the Codex login either.
 - **`codex:` models run Codex itself outside the jail.** Codex runs the model loop and could act on its own; see [OpenAI models through Codex](#openai-models-through-codex) for how that is refused.
 
 ## Options
@@ -106,6 +109,7 @@ Agents read a project you already have, run programs on your machine and, if a c
 | `--allow-read <PATH,PATH>` | none | Absolute paths outside the project that jailed commands may read, such as a toolchain under your home directory |
 | `--hide <PATH,PATH>` | none | Paths in the project, relative to its root, that agents may not see. A call is refused if git tracks anything under one of them |
 | `--usage-log <FILE>` | none | Append one JSON line per agent run to this file. It must be absolute and outside the projects agents work in |
+| `--transcript-dir <DIR>` | none | Keep a transcript of each agent run in this directory. It must be absolute and outside the projects agents work in |
 | `--probe <MODEL>...` | | Test the given models (one request and one tool call each) instead of serving |
 
 `--mcp-server --delegate` is accepted and ignored, so a command line written when the server had other modes still works. `--mcp-server` without `--delegate` is refused: it used to start a server that could not run a command.
@@ -156,6 +160,7 @@ A `codex:` model (`codex:gpt-6.2-sol`, say) runs on the account the [Codex CLI](
 - **How it works.** For each run the server starts `codex app-server` and hands it the agent's tools. Codex runs the model loop, and every tool call comes back to the server and runs as it does for any other provider, commands in the jail. Codex is killed when the run ends.
 - **Codex's own tools are refused, not removed.** Codex offers the model tools of its own besides the agent's (`apply_patch`, subagents, a JavaScript `exec` through which the agent's tools are called), and not all of them can be switched off. The server switches off what it can and gives Codex's thread no execution environment, a read-only sandbox and approval for everything, and does not use a thread that comes back otherwise. Without an environment, Codex's file and command tools have nowhere to act: asked to use them, they failed and the model carried on without them. Should Codex still try, the server refuses every approval it asks for and stops the run at the first sign of anything that is not a message, reasoning or a call of the agent's tools, or of work in another thread. That matters for subagents: Codex has no setting that removes them, and the model can start one. A run is not started if Codex would bring MCP servers or instruction files (`AGENTS.md`) of its own.
 - **Codex itself runs outside the jail, as you,** because it needs its login. It starts in an empty directory of its own, not in the project. With `--no-jail`, an agent's commands can read Codex's login in `~/.codex`.
+- **Codex's own retries are part of a run's time.** When the model is at capacity, Codex waits and sends the request again, once after almost six minutes on 2026-11-22, and a run waits with it. A transcript marks each with `codex_retry`, so the wait can be told apart from work.
 - **Turns.** `--max-turns` counts the model's responses. One response can call tools many times from a single `exec` script, so it does not cap tool calls.
 - **Cost.** Runs count against the plan's usage limits, not API billing. When the limit is reached the run fails and says so. Each request carries about 4,000 to 5,000 tokens of Codex's own instructions and tool descriptions, most of which come from the cache after the first.
 - **The server introduces itself to Codex as `clankistrator`**, and Codex passes that name on to OpenAI with every request.
@@ -171,7 +176,7 @@ A `codex:` model (`codex:gpt-6.2-sol`, say) runs on the account the [Codex CLI](
 ## Limitations
 
 - Linux only for the jail. Elsewhere the server starts only with `--no-jail`.
-- Token counts only include agent runs that finished; a run that errored or hit its turn limit is not counted.
+- The usage log counts tokens only for agent runs that finished; a run that errored or hit its turn limit has none there. Its transcript, if one was kept, has each response's tokens.
 - The test suite drives the server with scripted model replies; it makes no provider calls.
 - An agent cannot run an interactive program, and it has no way to ask the client a question mid-run.
 
@@ -185,12 +190,14 @@ cargo clippy --all-targets
 ```text
 src/
 ├── main.rs            Command line, settings, the jail policy, the probe report
-├── mcp.rs             The MCP server and the usage log
+├── mcp.rs             The MCP server, run ids and the usage log
+├── transcript.rs      A run's transcript
 ├── delegate.rs        One agent on one prompt in an existing project
 ├── llm.rs             Provider selection, retries, and the call into rig
 ├── codex.rs           codex: models, through `codex app-server`
 ├── probe.rs           The model check behind --probe
 └── tools/             File tools, command execution, and the jail
+build.rs               Records the commit a build came from
 integrations/          Files other tools need to use this server
 ```
 

@@ -1,0 +1,97 @@
+--- a/.claude/skills/ship/HISTORY.md	2026-11-22 15:15:49.943258557 -0500
++++ b/.claude/skills/ship/HISTORY.md	2026-11-22 15:20:06.039191171 -0500
+@@ -7,6 +7,28 @@
+ pre-edit copies from before that stay on the owner's machine under
+ `~/.claude/backups/`.
+ 
++## 2026-11-22: a runner call names its run and its transcript (<ticket>)
++
++- **Why.** Seen on SHIP-1590 (PR 314). In its round 1 the runner's implementer
++  (`codex:gpt-6.2-sol`) left five renames staged and reported a build blocked
++  by a sandbox denial. The run log could say what it found, but not which
++  command staged the renames or failed the build: the report was the agent's
++  own word, and a runner left no transcript to check it against, as a Claude
++  Code agent does.
++- **What changed outside the skill.** The runner tool now gives each call a
++  `run_id` and, on a machine that keeps them, a transcript: the prompt, every
++  tool call with its output, what the model said, and how the run ended. Its
++  usage log line carries the same id and the call's `report_path`, so a retro
++  can join each line to a ticket and a round by the report's name.
++- **The denial was the runner's bug, not the ticket's.** The tool hid a file
++  by mounting `/dev/null` over it, which its jail's mounts can't open, so a
++  build that reads every file under `.claude` failed with "Permission denied".
++  Hidden files now read as empty. A sandbox block on a hidden path is worth a
++  report to the tool's owner before it is taken as the ticket needing more.
++- **Why quote the transcript when the index check fails.** Stop condition 8
++  asks me a question. The lines that show what the agent ran answer the first
++  one I would ask.
++
+ ## 2026-11-14: earlier UI checks and an in-scope follow-up trial (SHIP-1711, SHIP-1712)
+ 
+ - **Why UI checks move.** The retro over 29 runs found 4 UI regressions after
+--- a/.claude/skills/ship/recipes/role-runners.md	2026-11-22 15:15:49.939258558 -0500
++++ b/.claude/skills/ship/recipes/role-runners.md	2026-11-22 15:16:05.047254582 -0500
+@@ -106,14 +106,16 @@
+   read and ran the change, not only pass 1's findings (HISTORY).
+ - **The report is the file at `report_path`,** as always. A runner may save the
+   agent's reply there when the agent couldn't write it.
+-- **Log what the result gives you:** seconds and token counts, when present.
++- **Log what the result gives you:** seconds, token counts, the `run_id` and the
++  `transcript` path, when present. A failed call's error names them too.
+ 
+ ### After a runner's implementer returns
+ 
+ Its agent may be able to run git. Before Phase 3's settle, confirm
+ `git rev-parse HEAD` is what you recorded, `git diff --cached --name-only` is
+ empty, and `git branch --show-current` is the effort branch. If any differs,
+-stop and show me (stop condition 8).
++stop and show me (stop condition 8), with the transcript's `tool_call` lines
++for the commands that did it, quoted (HISTORY).
+ 
+ ### After a runner's reviewer returns
+ 
+@@ -139,8 +141,9 @@
+ - the tool returns an error, whatever it says, or your wake-up fires first
+   (below);
+ - the report is not the role's report: no `STATUS:` line from an implementer,
+-  no `VERDICT:` line from a reviewer. The file at `report_path` is all there
+-  is; a runner's agent can't be messaged and has no transcript to recover;
++  no `VERDICT:` line from a reviewer. The file at `report_path` is the only
++  report; a runner's agent can't be messaged. Its transcript, when the result
++  names one, shows what it did and how far it got, but is not a report;
+ - a reviewer's report is unusable twice;
+ - an implementer's report says its sandbox blocked it (no network, an
+   environment file, the database, Docker).
+@@ -152,7 +155,8 @@
+ 
+ - **Run that role as the Claude Code `ship-*` agent,** exactly as SKILL.md says.
+   Never `general-purpose`. A fallback reviewer's slot says `Tree: shared`.
+-- **Log it:** `fallback: <role>, <model>: <the reason in one line>`.
++- **Log it:** `fallback: <role>, <model>: <the reason in one line>`, and
++  `run <run_id>` when the call named one.
+ - **Keep that model off for the rest of the run.** After a sandbox block, keep
+   the implementer on the Claude Code agent for the rest of the run: the ticket
+   needs something the sandbox lacks.
+@@ -192,7 +196,8 @@
+   implementer <model>`.
+ - **Each runner call,** at the end of that role's line (the implement entry, the
+   `Pass 2:` line, the `Adjudicated:` line): `via runner, <model>, <seconds> s,
+-  <input tokens> in (<cached> cached), <output tokens> out`. Input is the total
++  <input tokens> in (<cached> cached), <output tokens> out, run <run_id>
++  (<transcript path>)`, leaving out what the result does not give. Input is the total
+   as the tool returns it, the cached share included. One per call, a relaunch
+   included. A stepped-up round adds `(step-up from <model>)`.
+ - **The PR body,** when a runner took any role: which model wrote and which
+--- a/.claude/skills/ship/templates/run-log.md	2026-11-22 15:15:49.939258558 -0500
++++ b/.claude/skills/ship/templates/run-log.md	2026-11-22 15:16:05.063254578 -0500
+@@ -49,8 +49,8 @@
+ Agent finished. STATUS complete. CHECKS lint 0 · tsc 0 · tests 0.
+ UI-CHECK: <each real page opened at 390 and 1440 | not run — reason>
+ <!-- A runner call adds, at the end of its role's line (implement, Pass 2, Adjudicated):
+-     via runner, <model>, <seconds> s, <input> in (<cached> cached), <output> out.
+-     A fallback adds: fallback: <role>, <model>: <the reason in one line>. -->
++     via runner, <model>, <seconds> s, <input> in (<cached> cached), <output> out, run <run_id> (<transcript path>).
++     A fallback adds: fallback: <role>, <model>: <the reason in one line>, run <run_id>. -->
+ Files: `path` (what changed)
+ Deviations: none
+ 

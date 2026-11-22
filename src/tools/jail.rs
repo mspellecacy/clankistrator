@@ -82,6 +82,9 @@ pub enum Writes {
     Scratch,
 }
 
+/// The file in a run's directory that covers each file the jail hides.
+const EMPTY_FILE: &str = "empty";
+
 /// The files a jailed run keeps to itself, deleted with the run: a `/tmp`
 /// that lasts from one command to the next (each command is a jail of its
 /// own, so an ordinary empty `/tmp` would forget what the last one wrote),
@@ -120,6 +123,7 @@ impl RunFiles {
         for part in parts {
             std::fs::create_dir(dir.join(part)).map_err(failed)?;
         }
+        std::fs::write(dir.join(EMPTY_FILE), b"").map_err(failed)?;
         Ok(Self { dir, turn: scratch.then(|| tokio::sync::Mutex::new(())) })
     }
 }
@@ -161,7 +165,7 @@ pub struct Jail {
     policy: JailPolicy,
     writes: Writes,
     files: RunFiles,
-    /// Environment files in the project, each covered by an unreadable file.
+    /// Environment files in the project, each covered by an empty file.
     env_files: Vec<PathBuf>,
     /// For a worktree or submodule: the git directory its `.git` file points to.
     git_dir: Option<PathBuf>,
@@ -380,15 +384,20 @@ impl Jail {
             }
         }
 
+        // A hidden file is covered by an empty one, not by /dev/null: the
+        // jail's mounts allow no device files, so /dev/null there could not be
+        // opened at all, and a build that reads every file under a directory
+        // (Turbopack does) failed on it with "Permission denied".
+        let empty = self.files.dir.join(EMPTY_FILE);
         for path in hidden {
             match std::fs::symlink_metadata(path) {
                 Ok(meta) if meta.is_dir() => add(&[flag("--tmpfs"), path.as_os_str()]),
-                Ok(meta) if meta.is_file() => add(&[flag("--ro-bind"), flag("/dev/null"), path.as_os_str()]),
+                Ok(meta) if meta.is_file() => add(&[flag("--ro-bind"), empty.as_os_str(), path.as_os_str()]),
                 _ => {}
             }
         }
         for file in self.env_files.iter().filter(|file| file.is_file()) {
-            add(&[flag("--ro-bind"), flag("/dev/null"), file.as_os_str()]);
+            add(&[flag("--ro-bind"), empty.as_os_str(), file.as_os_str()]);
         }
 
         add(&[flag("--chdir"), cwd.as_os_str(), flag("--")]);

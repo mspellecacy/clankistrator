@@ -4,6 +4,7 @@ pub mod llm;
 pub mod mcp;
 pub mod probe;
 pub mod tools;
+pub mod transcript;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -76,10 +77,17 @@ struct Args {
     #[arg(long, value_delimiter = ',', value_name = "PATH,PATH")]
     hide: Vec<PathBuf>,
 
-    /// Append one line per agent run to this file (JSON: time, directory, agent, model, access,
-    /// outcome, seconds, tokens). It must be outside the projects agents work in
+    /// Append one line per agent run to this file (JSON: time, run id, directory, agent, model,
+    /// access, report path, outcome, kind of failure, seconds, tokens, version). Never a prompt,
+    /// reply or error text. It must be outside the projects agents work in
     #[arg(long, value_name = "FILE")]
     usage_log: Option<PathBuf>,
+
+    /// Keep a transcript of each agent run in this directory, as <run id>.jsonl: its prompt and
+    /// instructions, every tool call with its output (each cut to 16 KiB), what the model said,
+    /// and how it ended. Only you can read them. It must be outside the projects agents work in
+    #[arg(long, value_name = "DIR")]
+    transcript_dir: Option<PathBuf>,
 
     /// Test the given models instead of serving: one plain request and one tool call each.
     /// Uses no files and runs no commands
@@ -248,6 +256,12 @@ async fn run() -> Result<ExitCode> {
             usage_log: match &args.usage_log {
                 Some(log) if !log.is_absolute() => bail!("--usage-log {} must be an absolute path", log.display()),
                 log => log.clone(),
+            },
+            transcript_dir: match &args.transcript_dir {
+                Some(dir) if !dir.is_absolute() => {
+                    bail!("--transcript-dir {} must be an absolute path", dir.display())
+                }
+                dir => dir.clone(),
             },
         },
     );

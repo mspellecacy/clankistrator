@@ -14,6 +14,7 @@ use tokio::task::{AbortHandle, JoinSet};
 
 use crate::delegate::{self, Delegation};
 use crate::llm::Llm;
+use crate::transcript::Transcript;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const RUN_AGENT: &str = "run_agent";
@@ -38,17 +39,50 @@ pub struct Delegating {
     pub hidden: Vec<PathBuf>,
     /// A file that gets one line per agent run (see [`RunRecord`]).
     pub usage_log: Option<PathBuf>,
+    /// A directory that gets one transcript per agent run (see [`crate::transcript`]).
+    pub transcript_dir: Option<PathBuf>,
 }
 
 /// One line of the usage log: what ran, on which model, for how long, at what
 /// cost in tokens, and how it ended. Never the prompt, the reply or an error
-/// text. A run that ends without [`finish`](Self::finish), because its client
-/// cancelled it or went away, is written as "cancelled" when it is dropped.
+/// text: those go only into the run's transcript, which ends here too. A run
+/// that ends without [`finish`](Self::finish), because its client cancelled
+/// it or went away, is written as "cancelled" when it is dropped.
 struct RunRecord {
     log: Option<PathBuf>,
     summary: delegate::Summary,
+    run_id: String,
+    transcript: Option<Transcript>,
     started: std::time::Instant,
     written: bool,
+}
+
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs())
+}
+
+/// A name for one run, unique on this machine: when it started, this
+/// process, and how many runs this process had started before it.
+fn new_run_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let stamp: String = utc_timestamp(now_seconds()).chars().filter(char::is_ascii_alphanumeric).collect();
+    format!("{stamp}-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// This build's version, with the commit it was built from when the build knew it.
+fn version() -> String {
+    match option_env!("CLANKISTRATOR_COMMIT") {
+        Some(commit) => format!("{} ({commit})", env!("CARGO_PKG_VERSION")),
+        None => env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+fn usage_json(usage: &crate::llm::TokenUsage) -> Value {
+    json!({
+        "input_tokens": usage.input_tokens,
+        "cached_input_tokens": usage.cached_input_tokens,
+        "output_tokens": usage.output_tokens
+    })
 }
 
 /// Seconds since 1970 as an ISO 8601 UTC timestamp.
@@ -67,34 +101,75 @@ fn utc_timestamp(seconds: u64) -> String {
 }
 
 impl RunRecord {
-    fn start(log: Option<&Path>, summary: &delegate::Summary) -> Self {
-        Self { log: log.map(Path::to_path_buf), summary: summary.clone(), started: std::time::Instant::now(), written: false }
-    }
-
-    /// Write the run's line and return how many seconds it took.
-    fn finish(mut self, outcome: &Result<delegate::Outcome, String>) -> u64 {
-        match outcome {
-            Ok(outcome) => self.write("ok", Some(&outcome.usage)),
-            Err(_) => self.write("failed", None),
+    fn start(log: Option<&Path>, summary: &delegate::Summary, run_id: String, transcript: Option<Transcript>) -> Self {
+        Self {
+            log: log.map(Path::to_path_buf),
+            summary: summary.clone(),
+            run_id,
+            transcript,
+            started: std::time::Instant::now(),
+            written: false,
         }
-        self.started.elapsed().as_secs()
     }
 
-    fn write(&mut self, outcome: &str, usage: Option<&crate::llm::TokenUsage>) {
+    /// The run's id and its transcript, for whoever asked for the run.
+    fn reference(&self) -> Value {
+        json!({ "run_id": self.run_id, "transcript": self.transcript.as_ref().map(Transcript::path) })
+    }
+
+    /// Write the run's line and the end of its transcript, and return how many seconds it took.
+    fn finish(mut self, outcome: &Result<delegate::Outcome, delegate::Failure>) -> u64 {
+        let seconds = self.started.elapsed().as_secs();
+        match outcome {
+            Ok(outcome) => {
+                self.end(json!({
+                    "outcome": "ok",
+                    "seconds": seconds,
+                    "reply": outcome.reply,
+                    "report_path": outcome.report.as_ref().map(|report| &report.path),
+                    "report_written_by_agent": outcome.report.as_ref().map(|report| report.written_by_agent),
+                    "usage": usage_json(&outcome.usage),
+                }));
+                self.write("ok", Some(&outcome.usage), None);
+            }
+            Err(failure) => {
+                self.end(json!({
+                    "outcome": "failed",
+                    "seconds": seconds,
+                    "failure": failure.kind,
+                    "error": failure.message,
+                }));
+                self.write("failed", None, Some(failure.kind));
+            }
+        }
+        seconds
+    }
+
+    fn end(&self, fields: Value) {
+        if let Some(transcript) = &self.transcript {
+            transcript.record("end", fields);
+        }
+    }
+
+    fn write(&mut self, outcome: &str, usage: Option<&crate::llm::TokenUsage>, failure: Option<&str>) {
         self.written = true;
         let Some(log) = &self.log else { return };
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
         let line = json!({
-            "time": utc_timestamp(now),
+            "time": utc_timestamp(now_seconds()),
+            "run_id": self.run_id,
             "directory": self.summary.directory,
             "agent": self.summary.agent,
             "model": self.summary.model,
             "access": self.summary.access,
+            "report_path": self.summary.report_path,
             "outcome": outcome,
+            "failure": failure,
             "seconds": self.started.elapsed().as_secs(),
             "input_tokens": usage.map(|usage| usage.input_tokens),
             "cached_input_tokens": usage.map(|usage| usage.cached_input_tokens),
             "output_tokens": usage.map(|usage| usage.output_tokens),
+            "version": version(),
+            "transcript": self.transcript.as_ref().map(Transcript::path),
         });
         let appended = std::fs::OpenOptions::new().create(true).append(true).open(log).and_then(|mut file| {
             use std::io::Write as _;
@@ -110,7 +185,8 @@ impl RunRecord {
 impl Drop for RunRecord {
     fn drop(&mut self) {
         if !self.written {
-            self.write("cancelled", None);
+            self.end(json!({ "outcome": "cancelled", "seconds": self.started.elapsed().as_secs() }));
+            self.write("cancelled", None, None);
         }
     }
 }
@@ -149,21 +225,28 @@ fn tool_result(result: Result<String, String>) -> Value {
     }
 }
 
-fn agent_result(outcome: Result<delegate::Outcome, String>, seconds: u64) -> Value {
+/// What the caller is told about a finished run. `run` is the run's
+/// [`reference`](RunRecord::reference), which a failure names too: its
+/// transcript is the only account of how far the agent got.
+fn agent_result(outcome: Result<delegate::Outcome, delegate::Failure>, seconds: u64, run: &Value) -> Value {
+    let named = match (run["run_id"].as_str(), run["transcript"].as_str()) {
+        (Some(id), Some(transcript)) => format!("Run {id}; its transcript is {transcript}."),
+        (Some(id), None) => format!("Run {id}."),
+        _ => String::new(),
+    };
+    let outcome = outcome.map_err(|failure| format!("{}\n\n{named}", failure.message));
     tool_result(outcome.and_then(|outcome| {
         serde_json::to_string_pretty(&json!({
             "model": outcome.model,
             "seconds": seconds,
+            "run_id": run["run_id"],
+            "transcript": run["transcript"],
             "reply": outcome.reply,
             "report_path": outcome.report.as_ref().map(|report| &report.path),
             "report_written_by": outcome.report.as_ref().map(|report| {
                 if report.written_by_agent { "the agent" } else { "clankistrator, from the agent's reply" }
             }),
-            "usage": {
-                "input_tokens": outcome.usage.input_tokens,
-                "cached_input_tokens": outcome.usage.cached_input_tokens,
-                "output_tokens": outcome.usage.output_tokens
-            }
+            "usage": usage_json(&outcome.usage)
         }))
         .map_err(|e| e.to_string())
     }))
@@ -233,7 +316,7 @@ impl McpServer {
                                 agent.abort();
                             }
                         }
-                        Begun::Agent { id, progress_token, prepared } => {
+                        Begun::Agent { id, progress_token, mut prepared } => {
                             // Which messages a given client sends is best learnt from a real run.
                             tracing::info!(
                                 "Request {id}: starting an agent; the client {} progress notifications",
@@ -242,7 +325,7 @@ impl McpServer {
                             let llm = self.llm.clone();
                             let outgoing = outgoing.clone();
                             let response_id = id.clone();
-                            let record = RunRecord::start(self.usage_log(), prepared.summary());
+                            let record = self.start_run(&mut prepared);
                             let agent = agents.spawn(async move {
                                 let run = delegate::run(llm.as_ref(), *prepared);
                                 tokio::pin!(run);
@@ -268,8 +351,9 @@ impl McpServer {
                                         }
                                     }
                                 };
+                                let run = record.reference();
                                 let seconds = record.finish(&outcome);
-                                let _ = outgoing.send(respond(&response_id, Ok(agent_result(outcome, seconds))));
+                                let _ = outgoing.send(respond(&response_id, Ok(agent_result(outcome, seconds, &run))));
                             });
                             running.insert(request_key(&id), (agent, id));
                         }
@@ -304,11 +388,12 @@ impl McpServer {
         match self.begin(line).await {
             Begun::Reply(response) => response,
             Begun::Cancel(_) => None,
-            Begun::Agent { id, prepared, .. } => {
-                let record = RunRecord::start(self.usage_log(), prepared.summary());
+            Begun::Agent { id, mut prepared, .. } => {
+                let record = self.start_run(&mut prepared);
                 let outcome = delegate::run(self.llm.as_ref(), *prepared).await;
+                let run = record.reference();
                 let seconds = record.finish(&outcome);
-                Some(respond(&id, Ok(agent_result(outcome, seconds))))
+                Some(respond(&id, Ok(agent_result(outcome, seconds, &run))))
             }
         }
     }
@@ -365,6 +450,26 @@ impl McpServer {
         self.delegating.usage_log.as_deref()
     }
 
+    /// Give a run its id and, when the server keeps transcripts, start its
+    /// transcript with everything the agent is given.
+    fn start_run(&self, prepared: &mut delegate::Prepared) -> RunRecord {
+        let run_id = new_run_id();
+        let transcript = self.delegating.transcript_dir.as_deref().and_then(|dir| {
+            Transcript::create(dir, &run_id)
+                .map_err(|e| tracing::warn!("could not start a transcript in {}: {e}", dir.display()))
+                .ok()
+        });
+        if let Some(transcript) = &transcript {
+            let mut start = json!({ "run_id": run_id, "time": utc_timestamp(now_seconds()), "version": version() });
+            if let (Some(start), Value::Object(described)) = (start.as_object_mut(), prepared.describe()) {
+                start.extend(described);
+            }
+            transcript.record("start", start);
+            prepared.record_to(transcript.clone());
+        }
+        RunRecord::start(self.usage_log(), prepared.summary(), run_id, transcript)
+    }
+
     /// Check a `run_agent` call against what the server was started to allow.
     fn prepare_agent(&self, args: &Value) -> Result<delegate::Prepared, String> {
         let delegating = &self.delegating;
@@ -410,6 +515,15 @@ impl McpServer {
                 log.display()
             ));
         }
+        // A transcript holds what the agents saw; agents in the project would read them all.
+        if let Some(dir) = &delegating.transcript_dir
+            && dir.starts_with(&prepared.summary().directory)
+        {
+            return Err(format!(
+                "the transcript directory {} is inside the project; start the server with a --transcript-dir outside it",
+                dir.display()
+            ));
+        }
         Ok(prepared)
     }
 
@@ -434,6 +548,12 @@ impl McpServer {
                 "Without them it can still run commands, and a command can change files.",
             ),
         };
+        let kept = if delegating.transcript_dir.is_some() {
+            " Each run gets an id and a transcript on this machine (its prompt, every tool call with its output, \
+             what the model said, and how it ended); the result names both, a failure too."
+        } else {
+            ""
+        };
         json!({
             "name": RUN_AGENT,
             "description": format!(
@@ -442,7 +562,7 @@ impl McpServer {
                  read files and run commands in the directory, and with write_access also write and edit \
                  files. It has no skills, slash commands, subagents or MCP tools, so an agent file that only \
                  wraps one of those cannot be run this way. What the agent reads is sent to its model's \
-                 provider. {commands} A run takes minutes and costs tokens. Models: {models}."
+                 provider. {commands}{kept} A run takes minutes and costs tokens. Models: {models}."
             ),
             "inputSchema": {
                 "type": "object",
@@ -584,6 +704,7 @@ mod tests {
                     jail: None,
                     hidden: Vec::new(),
                     usage_log: Some(log.to_path_buf()),
+                    transcript_dir: None,
                 },
             )
         };
@@ -609,7 +730,13 @@ mod tests {
         let tokens = |name: &str| ok[name].as_u64();
         assert_eq!((tokens("input_tokens"), tokens("cached_input_tokens"), tokens("output_tokens")), (Some(10), Some(4), Some(2)));
         assert!(ok["time"].as_str().unwrap().ends_with('Z') && ok["seconds"].is_u64());
+        assert!(ok["run_id"].as_str().is_some_and(|id| !id.is_empty()), "{ok}");
+        assert_ne!(ok["run_id"], written[1]["run_id"], "each run has its own id");
+        assert_eq!(result["run_id"], ok["run_id"], "the caller is told the run's id");
+        assert!(ok["failure"].is_null() && ok["transcript"].is_null() && ok["report_path"].is_null(), "{ok}");
+        assert!(ok["version"].as_str().unwrap().starts_with(env!("CARGO_PKG_VERSION")));
         assert_eq!(written[1]["outcome"], "failed");
+        assert_eq!(written[1]["failure"], "error");
         assert!(written[1]["input_tokens"].is_null(), "a failed run's tokens are not known");
         let text = std::fs::read_to_string(&log).unwrap();
         for said in ["SECRET-PROMPT", "SECRET-REPLY", "SECRET-ERROR"] {
@@ -622,10 +749,12 @@ mod tests {
             agent: None,
             model: "ollama:small".into(),
             access: "scratch",
+            report_path: None,
         };
-        drop(RunRecord::start(Some(&log), &summary));
+        drop(RunRecord::start(Some(&log), &summary, "run-x".into(), None));
         assert_eq!(lines()[2]["outcome"], "cancelled");
         assert_eq!(lines()[2]["access"], "scratch");
+        assert_eq!(lines()[2]["run_id"], "run-x");
 
         // A log that cannot be written does not fail the run.
         let server = server_with(Arc::new(ActingLlm::replying("fine")), &elsewhere.path().join("no/such/dir/usage.jsonl"));
@@ -640,6 +769,113 @@ mod tests {
         assert!(!inside.exists());
     }
 
+    /// Lists the project with its tools, as an agent looking around does, then replies.
+    struct Looking;
+    impl Llm for Looking {
+        fn run<'a>(&'a self, request: AgentRequest) -> LlmFuture<'a> {
+            Box::pin(async move {
+                let tools = request.build_tools();
+                let list = tools.iter().find(|tool| tool.name() == "list_files").expect("a list_files tool");
+                let listing = list
+                    .call(json!({"directory": "."}).to_string())
+                    .await
+                    .map_err(|e| crate::llm::LlmError::Other(anyhow::anyhow!("{e}")))?;
+                Ok(LlmReply { text: format!("SEEN {} bytes", listing.len()), usage: TokenUsage::default() })
+            })
+        }
+    }
+
+    fn transcript_events(path: &Path) -> Vec<Value> {
+        std::fs::read_to_string(path).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_transcript_records_the_run_and_the_log_and_the_result_name_it() {
+        let project = crate::delegate::tests::project();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let (log, dir) = (elsewhere.path().join("usage.jsonl"), elsewhere.path().join("transcripts"));
+        let server_with = |llm: Arc<dyn Llm>, dir: &Path| {
+            McpServer::new(
+                llm,
+                Delegating {
+                    models: vec!["ollama:small".into()],
+                    max_turns: 3,
+                    command_timeout: Duration::from_secs(30),
+                    jail: None,
+                    hidden: Vec::new(),
+                    usage_log: Some(log.clone()),
+                    transcript_dir: Some(dir.to_path_buf()),
+                },
+            )
+        };
+        let logged = || -> Vec<Value> {
+            std::fs::read_to_string(&log).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+        };
+        let arguments = json!({
+            "directory": project.path(),
+            "agent": "reviewer",
+            "prompt": "THE-PROMPT",
+            "report_path": "tmp/ship-1-review-r1.md"
+        });
+
+        let server = server_with(Arc::new(Looking), &dir);
+        let description = McpServer::run_agent_tool(&server.delegating).to_string();
+        assert!(description.contains("transcript"), "the caller is told runs are kept: {description}");
+        let done = call(&server, run_agent(1, arguments.clone())).await;
+        let result: Value = serde_json::from_str(tool_text(&done)).unwrap();
+        let run_id = result["run_id"].as_str().unwrap().to_string();
+        let path = PathBuf::from(result["transcript"].as_str().unwrap());
+        assert_eq!(path, dir.join(format!("{run_id}.jsonl")));
+
+        let events = transcript_events(&path);
+        let names: Vec<&str> = events.iter().map(|event| event["event"].as_str().unwrap()).collect();
+        assert_eq!(names, ["start", "tool_call", "tool_result", "end"]);
+        let start = &events[0];
+        assert_eq!((&start["run_id"], &start["prompt"]), (&json!(run_id), &json!("THE-PROMPT")));
+        assert!(start["instructions"].as_str().unwrap().contains("You review a change you did not write."));
+        assert_eq!((&start["agent"], &start["access"]), (&json!("reviewer"), &json!("read")));
+        assert_eq!(start["report_path"], "tmp/ship-1-review-r1.md");
+        assert_eq!((&events[1]["tool"], &events[1]["arguments"]), (&json!("list_files"), &json!({"directory": "."})));
+        assert!(events[2]["output"].as_str().unwrap().contains(".claude"), "{}", events[2]);
+        assert_eq!(events[3]["outcome"], "ok");
+        assert!(events[3]["reply"].as_str().unwrap().starts_with("SEEN"), "{}", events[3]);
+
+        let line = &logged()[0];
+        assert_eq!((&line["run_id"], &line["transcript"]), (&json!(run_id), &json!(path)));
+        assert_eq!(line["report_path"], "tmp/ship-1-review-r1.md");
+        assert!(!std::fs::read_to_string(&log).unwrap().contains("THE-PROMPT"), "the log still holds nothing said");
+
+        // A failure names its transcript too: it is the only account of how far the agent got.
+        let failing = server_with(Arc::new(ActingLlm::new(|_| Err("503 overloaded".to_string()))), &dir);
+        let failed = call(&failing, run_agent(2, arguments.clone())).await;
+        assert_eq!(failed["result"]["isError"], true);
+        let line = &logged()[1];
+        assert_eq!(line["failure"], "error");
+        let path = line["transcript"].as_str().unwrap();
+        assert!(tool_text(&failed).contains(path), "{failed}");
+        let end = transcript_events(Path::new(path)).pop().unwrap();
+        assert_eq!((&end["event"], &end["outcome"], &end["failure"]), (&json!("end"), &json!("failed"), &json!("error")));
+        assert!(end["error"].as_str().unwrap().contains("503 overloaded"), "{end}");
+
+        // A run that never reaches its end says so in its transcript as well.
+        let transcript = Transcript::create(&dir, "cut-short").unwrap();
+        let summary = crate::delegate::Summary {
+            directory: project.path().to_path_buf(),
+            agent: None,
+            model: "ollama:small".into(),
+            access: "write",
+            report_path: None,
+        };
+        drop(RunRecord::start(Some(&log), &summary, "cut-short".into(), Some(transcript.clone())));
+        assert_eq!(transcript_events(transcript.path()).pop().unwrap()["outcome"], "cancelled");
+
+        // Inside the project, the agents working there would read every transcript.
+        let inside = project.path().canonicalize().unwrap().join("transcripts");
+        let refused = call(&server_with(Arc::new(ActingLlm::replying("unused")), &inside), run_agent(3, arguments)).await;
+        assert!(tool_text(&refused).contains("inside the project"), "{refused}");
+        assert!(!inside.exists());
+    }
+
     #[test]
     fn the_tool_description_says_whether_commands_are_jailed() {
         let mut delegating = Delegating {
@@ -649,6 +885,7 @@ mod tests {
             jail: None,
             hidden: Vec::new(),
             usage_log: None,
+            transcript_dir: None,
         };
         let text = |delegating: &Delegating| McpServer::run_agent_tool(delegating).to_string();
         assert!(text(&delegating).contains("ordinary processes, not jailed"));
@@ -673,6 +910,7 @@ mod tests {
                 jail: None,
                 hidden: Vec::new(),
                 usage_log: None,
+                transcript_dir: None,
             },
         )
     }

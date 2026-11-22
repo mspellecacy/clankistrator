@@ -395,7 +395,14 @@ where
     let other = LlmError::Other;
     let mut wire = Wire { lines: reader.lines(), writer, next_id: 0 };
 
-    let tools: Arc<Vec<Box<dyn ToolDyn>>> = Arc::new(request.tools.build(&request.sandbox));
+    // What Codex reports along the way goes into the run's transcript: never a
+    // message of Codex's as it came, only the parts that say what the agent did.
+    let note = |event: &str, fields: Value| {
+        if let Some(transcript) = &request.transcript {
+            transcript.record(event, fields);
+        }
+    };
+    let tools: Arc<Vec<Box<dyn ToolDyn>>> = Arc::new(request.build_tools());
     let mut specs = Vec::with_capacity(tools.len());
     for tool in tools.iter() {
         let definition = tool.definition(String::new()).await;
@@ -407,16 +414,19 @@ where
         }));
     }
 
-    wire.call(
-        "initialize",
-        json!({
-            "clientInfo": {"name": CLIENT_NAME, "title": null, "version": env!("CARGO_PKG_VERSION")},
-            // Dynamic tools are part of the experimental API.
-            "capabilities": {"experimentalApi": true},
-        }),
-    )
-    .await
-    .map_err(other)?;
+    let initialized = wire
+        .call(
+            "initialize",
+            json!({
+                "clientInfo": {"name": CLIENT_NAME, "title": null, "version": env!("CARGO_PKG_VERSION")},
+                // Dynamic tools are part of the experimental API.
+                "capabilities": {"experimentalApi": true},
+            }),
+        )
+        .await
+        .map_err(other)?;
+    // It names Codex's version, which the protocol is still changing between.
+    note("codex", json!({"user_agent": initialized.get("userAgent").and_then(Value::as_str)}));
     wire.send(&json!({"method": "initialized"})).await.map_err(other)?;
 
     let started = wire
@@ -558,13 +568,30 @@ where
                                     )));
                                 }
                             }
-                            "item/completed" => {
-                                if params.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage")
-                                    && let Some(text) = params.pointer("/item/text").and_then(Value::as_str)
-                                {
-                                    turn.reply = Some(text.to_string());
+                            "item/completed" => match params.pointer("/item/type").and_then(Value::as_str) {
+                                Some("agentMessage") => {
+                                    if let Some(text) = params.pointer("/item/text").and_then(Value::as_str) {
+                                        note("message", json!({"text": text}));
+                                        turn.reply = Some(text.to_string());
+                                    }
                                 }
-                            }
+                                Some("reasoning") => {
+                                    let joined = |field: &str| {
+                                        let parts: Vec<&str> = params
+                                            .pointer(&format!("/item/{field}"))
+                                            .and_then(Value::as_array)
+                                            .map(|parts| parts.iter().filter_map(Value::as_str).collect())
+                                            .unwrap_or_default();
+                                        (!parts.is_empty()).then(|| crate::transcript::capped(&parts.join("\n")).0)
+                                    };
+                                    let (summary, content) = (joined("summary"), joined("content"));
+                                    if summary.is_some() || content.is_some() {
+                                        note("reasoning", json!({"summary": summary, "content": content}));
+                                    }
+                                }
+                                Some("contextCompaction") => note("compaction", json!({})),
+                                _ => {}
+                            },
                             "thread/tokenUsage/updated" => {
                                 turn.responses += 1;
                                 let total = params.pointer("/tokenUsage/total").unwrap_or(&NULL);
@@ -576,13 +603,27 @@ where
                                     0,
                                     count("outputTokens"),
                                 );
+                                let last = params.pointer("/tokenUsage/last").unwrap_or(&NULL);
+                                let count = |field: &str| last.get(field).and_then(Value::as_u64).unwrap_or(0);
+                                note(
+                                    "response",
+                                    json!({"usage": {
+                                        "input_tokens": count("inputTokens"),
+                                        "cached_input_tokens": count("cachedInputTokens"),
+                                        "output_tokens": count("outputTokens"),
+                                    }}),
+                                );
                             }
                             "error" => {
                                 let text =
                                     params.pointer("/error/message").and_then(Value::as_str).unwrap_or("no reason given");
+                                // A retry can wait minutes (a model at capacity), which the
+                                // transcript shows as the time to the next event.
                                 if params.get("willRetry").and_then(Value::as_bool) == Some(true) {
                                     tracing::warn!("Codex: {text} (it is trying again)");
+                                    note("codex_retry", json!({"message": text}));
                                 } else {
+                                    note("codex_error", json!({"message": text}));
                                     turn.error = Some(text.to_string());
                                 }
                             }
@@ -730,6 +771,7 @@ mod tests {
             tools,
             sandbox,
             max_turns,
+            transcript: None,
         };
         (dir, request)
     }
@@ -796,6 +838,41 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!((&tools[0]["type"], &tools[0]["name"]), (&json!("function"), &json!("get_code")));
         assert_eq!(tools[0]["inputSchema"]["required"], json!(["words"]));
+    }
+
+    #[tokio::test]
+    async fn what_the_agent_did_goes_into_the_transcript_and_codexs_own_messages_do_not() {
+        let (dir, mut request) = request(ToolAccess::Probe(4242), 4);
+        let transcript = crate::transcript::Transcript::create(&dir.path().join("t"), "run").unwrap();
+        request.transcript = Some(transcript.clone());
+        let (outcome, ()) = against(request, |mut codex| async move {
+            codex.start().await;
+            codex
+                .notify("error", json!({"threadId": "t1", "turnId": "u1", "willRetry": true,
+                    "error": {"message": "Selected model is at capacity."}}))
+                .await;
+            codex.item("completed", json!({"type": "reasoning", "summary": ["Call the tool."], "content": []})).await;
+            codex.item("started", json!({"type": "dynamicToolCall", "tool": "get_code"})).await;
+            codex.call_tool(7, "get_code", json!({"words": ["alpha", "beta"]})).await;
+            codex.usage(9_200, 9_000, 50).await;
+            codex.item("completed", json!({"type": "agentMessage", "text": "PROBE-4242"})).await;
+            codex.complete("completed", Value::Null).await;
+        })
+        .await;
+        assert_eq!(outcome.unwrap().text, "PROBE-4242");
+
+        let text = std::fs::read_to_string(transcript.path()).unwrap();
+        let events: Vec<Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let names: Vec<&str> = events.iter().map(|event| event["event"].as_str().unwrap()).collect();
+        assert_eq!(names, ["codex", "codex_retry", "reasoning", "tool_call", "tool_result", "response", "message"]);
+        assert_eq!(events[0]["user_agent"], "fake");
+        assert_eq!(events[1]["message"], "Selected model is at capacity.");
+        assert_eq!((&events[2]["summary"], &events[2]["content"]), (&json!("Call the tool."), &Value::Null));
+        assert_eq!((&events[3]["tool"], &events[3]["arguments"]), (&json!("get_code"), &json!({"words": ["alpha", "beta"]})));
+        assert_eq!((&events[4]["ok"], &events[4]["output"]), (&json!(true), &json!("PROBE-4242")));
+        assert_eq!(events[5]["usage"]["cached_input_tokens"], 9_000);
+        assert_eq!(events[6]["text"], "PROBE-4242");
+        assert!(!text.contains("thread/start") && !text.contains("\"threadId\""), "none of Codex's messages as sent");
     }
 
     #[tokio::test]
