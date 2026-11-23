@@ -16,6 +16,9 @@
 //!   everything. A thread that comes back otherwise is not used. Without an
 //!   environment, Codex's file and command tools have nowhere to act: asked to
 //!   use them, they failed, and the model carried on without them.
+//!   Codex's note to the model on that sandbox is left out: it describes
+//!   Codex's own tools, and a model with write access, told its sandbox only
+//!   permits reading files, stopped before changing anything.
 //! - Every approval Codex asks for is refused, and ends the run.
 //! - The first item that is not a message, reasoning or a call of one of the
 //!   agent's tools, and anything about another thread (a subagent's), ends the
@@ -89,7 +92,8 @@ const ALLOWED_ITEMS: &[&str] = &["userMessage", "agentMessage", "reasoning", "dy
 const CLIENT_NAME: &str = "clankistrator";
 
 const DEVELOPER_INSTRUCTIONS: &str = "Only the tools described in your instructions work here (in `exec` they are \
-     `tools.<name>`). Codex's own tools for files, commands, patches, subagents and the web are not available.";
+     `tools.<name>`). Codex's own tools for files, commands, patches, subagents and the web are not available. \
+     Codex's sandbox and approval settings are for those tools: what you may read and change is in your instructions.";
 
 /// Codex sometimes reports its thread idle and never sends `turn/completed`
 /// (seen with codex-cli 0.171.0). After this long idle, the turn is taken as over.
@@ -443,6 +447,9 @@ where
                 "dynamicTools": specs,
                 // No environment: Codex's own tools have nowhere to run commands or apply patches.
                 "environments": [],
+                // Without this, Codex tells the model that its sandbox only permits reading
+                // files. That is true of Codex's own tools, not of the agent's.
+                "config": {"include_permissions_instructions": false},
             }),
         )
         .await
@@ -830,6 +837,7 @@ mod tests {
         assert_eq!(thread["sandbox"], "read-only");
         assert_eq!(thread["approvalPolicy"], "untrusted");
         assert_eq!(thread["environments"], json!([]));
+        assert_eq!(thread["config"], json!({"include_permissions_instructions": false}));
         assert_eq!(thread["ephemeral"], true);
         assert_eq!(thread["cwd"], "/empty");
         assert_eq!(thread["baseInstructions"], "You are a test.");
